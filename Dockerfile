@@ -18,5 +18,6 @@ RUN chmod -R a+rX /opt/sqlglot
 COPY selector.py /app/selector.py
 COPY br /app/br
 COPY maps /app/maps
-RUN chmod -R a+rX /app && python -m compileall -q /app/br
+RUN python /app/br/compile_map.py /app/maps/map.json.gz /app/maps/map.pkl \
+    && chmod -R a+rX /app && python -m compileall -q /app/br
 CMD ["python", "/app/selector.py"]

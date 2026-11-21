@@ -255,3 +255,62 @@ def single_compare_swap(a, b):
 
     rec(a, b)
     return diffs[0] if len(diffs) == 1 else None
+
+
+def single_diff(a, b):
+    """If old/new module ASTs differ in exactly one place, return
+    (old_node, new_node, ancestors) for the smallest differing node pair
+    (ancestors = old-tree path from the module down to, excluding, old_node)."""
+    if a is None or b is None:
+        return None
+    found = []
+
+    def rec(x, y, path):
+        if len(found) > 1:
+            return
+        if type(x) is not type(y):
+            found.append((x, y, path))
+            return
+        if isinstance(x, ast.AST):
+            # a node whose own primitive fields differ is the diff point
+            for f in x._fields:
+                vx, vy = getattr(x, f, None), getattr(y, f, None)
+                if not isinstance(vx, (ast.AST, list)) and vx != vy:
+                    found.append((x, y, path))
+                    return
+                if isinstance(vx, ast.AST) and isinstance(vy, ast.AST) and type(vx) is not type(vy) \
+                        and isinstance(vx, (ast.boolop, ast.operator, ast.unaryop, ast.cmpop)):
+                    found.append((x, y, path))
+                    return
+            for f in x._fields:
+                rec(getattr(x, f, None), getattr(y, f, None), path + [x])
+        elif isinstance(x, list):
+            if len(x) != len(y):
+                found.append((path[-1] if path else None, None, path[:-1]))
+                return
+            for i, j in zip(x, y):
+                rec(i, j, path)
+                if len(found) > 1:
+                    return
+        elif x != y:
+            found.append((path[-1] if path else None, None, path[:-1]))
+
+    rec(a, b, [])
+    if len(found) != 1 or found[0][0] is None:
+        return None
+    return found[0]
+
+
+BOOL_CONTEXT = (ast.If, ast.While, ast.Assert)
+
+
+def in_bool_context(node, parent):
+    if isinstance(parent, BOOL_CONTEXT) and parent.test is node:
+        return True
+    if isinstance(parent, ast.IfExp) and parent.test is node:
+        return True
+    if isinstance(parent, ast.UnaryOp) and isinstance(parent.op, ast.Not):
+        return True
+    if isinstance(parent, ast.comprehension) and node in parent.ifs:
+        return True
+    return False

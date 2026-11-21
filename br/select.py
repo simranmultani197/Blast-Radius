@@ -13,8 +13,15 @@ from . import patch as P
 
 class CovMap:
     def __init__(self, path):
-        with gzip.open(path, "rb") as f:
-            d = json.loads(f.read())
+        pkl = path[: -len(".json.gz")] + ".pkl" if path.endswith(".json.gz") else None
+        if pkl and os.path.exists(pkl):
+            import pickle
+
+            with open(pkl, "rb") as f:
+                d = pickle.load(f)
+        else:
+            with gzip.open(path, "rb") as f:
+                d = json.loads(f.read())
         self.tests = d["tests"]
         self._sets_raw = d["sets"]
         self._sets = {}
@@ -30,6 +37,14 @@ class CovMap:
         self.str_names = set(d.get("str_names", []))
         self.du = d.get("du")
         self.du_strings = set(self.du["strings"]) if self.du else set()
+        self.dkeys = d.get("dkeys")
+        self.dall = d.get("dall", {})
+        self.dimport = set(d.get("dimport", []))
+        self.ev = d.get("ev")
+        self.ev_unknown = frozenset(d.get("ev_unknown", []))
+        self.cmp_unknown = frozenset(d.get("cmp_unknown", []))
+        self.dict_unknown = frozenset(d.get("dict_unknown", []))
+        self.ev_import = set(d.get("ev_import", []))
         self.cmp = d.get("cmp")
         self.cmp_import = set(d.get("cmp_import", []))
         self.all = frozenset(range(len(self.tests)))
@@ -154,6 +169,11 @@ def analyze_py(path, old_src, new_src, fp: P.FilePatch, cmap: CovMap, ch: Change
         ch.add(cmap.file_tests(path), f"syntax error {path}")
         ch.broad = True
         return
+    if cmap.ev is not None:
+        _index_cached(path, old_src, old_tree)
+        tests = expression_rules(cmap, path, old_tree, new_tree, ch)
+        if tests is not None:
+            return
     if cmap.cmp is not None:
         sw = A.single_compare_swap(old_tree, new_tree)
         if sw is not None:
@@ -161,7 +181,12 @@ def analyze_py(path, old_src, new_src, fp: P.FilePatch, cmap: CovMap, ch: Change
             site = f"{path}:{line}:{col}"
             if site not in cmap.cmp_import and new_op in CMP_ALTS.get(old_op, ()):
                 sid = cmap.cmp.get(f"{site}|{new_op}")
-                ch.add(cmap.set(sid) if sid is not None else (), f"{site} {old_op}->{new_op}")
+                tests = set(cmap.set(sid)) if sid is not None else set()
+                if cmap.cmp_unknown:
+                    u = _index_cached(path, old_src, old_tree).smallest_unit(line)
+                    if u is not None:
+                        tests |= cmap.span_tests(path, u.start, u.end) & cmap.cmp_unknown
+                ch.add(tests, f"{site} {old_op}->{new_op}")
                 ch.notes.append(f"compare rule {site} {old_op}->{new_op}")
                 return
     fi = _index_cached(path, old_src, old_tree)
@@ -193,6 +218,16 @@ def analyze_py(path, old_src, new_src, fp: P.FilePatch, cmap: CovMap, ch: Change
         if u.scope == "function":
             ch.add(cmap.span_tests(path, u.start, u.end), f"{path}:{line} {u.kind}")
             continue
+        if u.scope in ("class", "module") and cmap.dkeys is not None and line in cols:
+            tests = dict_rule(cmap, path, u, line, cols[line], new_tree)
+            if tests is not None and cmap.dict_unknown:
+                fb = Change()
+                _scope_rule(path, fi, u, cmap, fb, "fallback")
+                tests |= set(fb.tests) & cmap.dict_unknown
+            if tests is not None:
+                ch.add(tests, f"{path}:{line} dict entry")
+                ch.notes.append(f"dict rule {path}:{line}")
+                continue
         _scope_rule(path, fi, u, cmap, ch, f"{path}:{line} {u.kind}@{u.scope}")
     for p in inserts:
         indent = _indent_of(ins_text.get(p, []))
@@ -304,6 +339,181 @@ def _scope_rule(path, fi, u, cmap, ch, why, attrs=None):
                 return
     ch.add(cmap.span_tests(path, u.start, u.end), why + " importers")
     ch.broad = True
+
+
+def _ev_tests(cmap, node, tags=("T", "F", "?")):
+    site = f"{node.lineno}:{node.col_offset}"
+    return site, tags
+
+
+def expression_rules(cmap, path, old_tree, new_tree, ch):
+    """Single expression-level edits, using the evaluation/outcome profiles.
+    Returns the selected set (already added to ch) or None to fall through."""
+    d = A.single_diff(old_tree, new_tree)
+    if d is None:
+        return None
+    x, y, anc = d
+    line = getattr(x, "lineno", None)
+    if line is None:
+        return None
+    u = _INDEX[path].smallest_unit(line) if path in _INDEX else None
+    if u is None:
+        return None
+    if u.scope != "function":
+        return None  # import-time code: leave it to the class/module rules
+    executors = cmap.span_tests(path, u.start, u.end)
+
+    def ev(node, tags=("T", "F", "?")):
+        site = f"{path}:{node.lineno}:{node.col_offset}"
+        if any(f"{site}|{t}" in cmap.ev_import for t in ("T", "F", "?")):
+            return None
+        out = set()
+        for t in tags:
+            sid = cmap.ev.get(f"{site}|{t}")
+            if sid is not None:
+                out |= cmap.set(sid)
+        return out
+    # 1. comparison operator swap: outcome profile
+    if isinstance(x, (ast.Compare, ast.cmpop)) and cmap.cmp is not None:
+        sw = A.single_compare_swap(old_tree, new_tree)
+        if sw is not None:
+            line, col, old_op, new_op = sw
+            site = f"{path}:{line}:{col}"
+            if site not in cmap.cmp_import and new_op in CMP_ALTS.get(old_op, ()):
+                sid = cmap.cmp.get(f"{site}|{new_op}")
+                tests = set(cmap.set(sid)) if sid is not None else set()
+                tests |= executors & cmap.cmp_unknown
+                ch.add(tests, f"{site} {old_op}->{new_op}")
+                ch.notes.append(f"compare rule {site} {old_op}->{new_op}")
+                return tests
+    # 2. and <-> or on two operands, where only truthiness matters
+    if isinstance(x, ast.BoolOp) and isinstance(y, ast.BoolOp) and type(x.op) is not type(y.op) \
+            and len(x.values) == 2 and anc and A.in_bool_context(x, anc[-1]) \
+            and all(A.ast_equal(p, q) for p, q in zip(x.values, y.values)):
+        flip = "F" if isinstance(x.op, ast.And) else "T"
+        a = ev(x.values[0], (flip, "?"))
+        b = ev(x.values[1], (flip, "?"))
+        if a is not None and b is not None:
+            tests = a | b | (executors & cmap.ev_unknown)
+            ch.add(tests, f"{path}:{x.lineno} boolop {type(x.op).__name__}->{type(y.op).__name__}")
+            ch.notes.append(f"boolop rule {path}:{x.lineno}")
+            return tests
+    # 3. an edit inside a short-circuited operand or a ternary branch
+    chain = anc + [x]
+    for i in range(len(chain) - 1, 0, -1):
+        parent, child = chain[i - 1], chain[i]
+        operand = None
+        if isinstance(parent, ast.BoolOp) and child in parent.values[1:]:
+            operand = child
+        elif isinstance(parent, ast.IfExp) and (child is parent.body or child is parent.orelse):
+            operand = child
+        if operand is not None:
+            if isinstance(x, (ast.Lambda, ast.NamedExpr)) or any(isinstance(n, (ast.NamedExpr, ast.Lambda, ast.Yield,
+                                                                                ast.YieldFrom, ast.Await))
+                                                              for n in ast.walk(operand)):
+                return None
+            tests = ev(operand)
+            if tests is None:
+                return None
+            tests |= executors & cmap.ev_unknown
+            ch.add(tests, f"{path}:{operand.lineno} evaluated operand")
+            ch.notes.append(f"operand rule {path}:{operand.lineno}:{operand.col_offset}")
+            return tests
+        if isinstance(parent, (ast.stmt, ast.Lambda, ast.comprehension)):
+            break
+    return None
+
+
+def _key_reprs(node):
+    if isinstance(node, ast.Constant):
+        v = node.value
+        if isinstance(v, bool) or v is None:
+            return {f"c:{v!r}"}
+        if isinstance(v, str):
+            return {f"s:{v}"}
+        if isinstance(v, int):
+            return {f"i:{v}"}
+        return None
+    if isinstance(node, ast.Attribute):
+        return {f"t:{node.attr}", f"e:{node.attr}"}
+    if isinstance(node, ast.Tuple):
+        parts = [_key_reprs(e) for e in node.elts]
+        if any(p is None for p in parts) or len(node.elts) > 4:
+            return None
+        out = {"u:"}
+        for i, p in enumerate(parts):
+            out = {f"{o}{'|' if i else ''}{x}" for o in out for x in p}
+        return out
+    return None
+
+
+def _span_contains(node, line, c0, c1):
+    s_ok = (line > node.lineno) or (line == node.lineno and c0 >= node.col_offset)
+    e_ok = (line < node.end_lineno) or (line == node.end_lineno and c1 <= node.end_col_offset)
+    return s_ok and e_ok
+
+
+def dict_rule(cmap, path, u, line, cols, new_tree):
+    """A change inside one entry of a traced class/module-level dict literal."""
+    st = u.node
+    if not isinstance(st, (ast.Assign, ast.AnnAssign)) or not isinstance(st.value, ast.Dict):
+        return None
+    tg = st.targets if isinstance(st, ast.Assign) else [st.target]
+    if len(tg) != 1 or not isinstance(tg[0], ast.Name):
+        return None
+    mod = A.module_name(path)
+    origin = f"{mod}:{u.qual}:{tg[0].id}" if u.scope == "class" else f"{mod}::{tg[0].id}"
+    if f"{origin}|created" not in cmap.dimport:
+        return None
+    c0, c1 = cols
+    d = st.value
+    hit = None
+    for i, (k, v) in enumerate(zip(d.keys, d.values)):
+        if k is not None and _span_contains(k, line, c0, c1):
+            hit = (i, "key")
+        elif _span_contains(v, line, c0, c1):
+            hit = (i, "value" if k is not None else "spread")
+    if hit is None or hit[1] == "spread":
+        return None
+    i, where = hit
+    imports = {m for m in ("get", "keys", "vals") if f"{origin}|{m}" in cmap.dimport}
+    old_reprs = _key_reprs(d.keys[i])
+    if old_reprs is None:
+        return None
+    reprs = set(old_reprs)
+    if where == "value":
+        if imports & {"get", "vals"}:
+            return None
+        alls = ("vals",)
+    else:
+        if imports:
+            return None
+        new_reprs = _new_key_reprs(new_tree, st, i)
+        if new_reprs is None:
+            return None
+        reprs |= new_reprs
+        alls = ("vals", "keys")
+    out = set()
+    for r in reprs:
+        sid = cmap.dkeys.get(f"{origin}|{r}")
+        if sid is not None:
+            out |= cmap.set(sid)
+    for m in alls:
+        sid = cmap.dall.get(f"{origin}|{m}")
+        if sid is not None:
+            out |= cmap.set(sid)
+    return out
+
+
+def _new_key_reprs(new_tree, old_stmt, i):
+    if new_tree is None:
+        return None
+    for n in ast.walk(new_tree):
+        if isinstance(n, type(old_stmt)) and n.lineno == old_stmt.lineno and isinstance(n.value, ast.Dict):
+            if len(n.value.keys) != len(old_stmt.value.keys) or n.value.keys[i] is None:
+                return None
+            return _key_reprs(n.value.keys[i])
+    return None
 
 
 def _uses_globals(fi):

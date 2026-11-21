@@ -56,6 +56,7 @@ def main():
 
     todo = [t for t in tests if not os.path.exists(f"{out}/{t['number']}.result")]
     running = {}
+    started = {}
     t0 = time.time()
     done = 0
     while todo or running:
@@ -63,6 +64,7 @@ def main():
             t = todo.pop(0)
             pid = os.fork()
             if pid == 0:
+                os.setsid()
                 try:
                     devnull = os.open(os.devnull, os.O_WRONLY)
                     os.dup2(devnull, 1)
@@ -71,8 +73,23 @@ def main():
                 finally:
                     os._exit(0)
             running[pid] = t
-        pid, _ = os.wait()
+            started[pid] = time.time()
+        limit = float(os.environ.get("BR_TRACE_LIMIT", "1e9"))
+        while True:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+            if pid:
+                break
+            for p_, st_ in list(started.items()):
+                if p_ in running and time.time() - st_ > limit:
+                    import signal
+                    try:
+                        os.killpg(p_, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    print(f"killed {running[p_]['id']} after {limit}s", flush=True)
+            time.sleep(0.2)
         running.pop(pid, None)
+        started.pop(pid, None)
         done += 1
         if done % 100 == 0:
             print(f"{done} done, {time.time() - t0:.0f}s", flush=True)

@@ -26,11 +26,25 @@ def main():
     cmp_diff = collections.defaultdict(set)
     cmp_import = set()
     have_cmp = False
+    dkeys = collections.defaultdict(set)
+    dall = collections.defaultdict(set)
+    dimport = set()
+    have_dict = False
+    ev = collections.defaultdict(set)
+    ev_import = set()
     num_to_id = {str(t["number"]): t["id"] for t in tests}
     paths = [p for d in trace_dir.split(",") for p in glob.glob(f"{d}/*.*.json")]
+    has_dict, has_ev, has_cmp = set(), set(), set()
+    # feature -> trace dir -> test -> [processes recorded, processes with the feature]
+    per_dir = collections.defaultdict(lambda: collections.defaultdict(lambda: [0, 0]))
     for p in paths:
         r = json.load(open(p))
         ti = index[num_to_id[r["test"]]]
+        tdir = os.path.dirname(p)
+        for feat, field in (("dict", "dict_keys"), ("ev", "ev"), ("cmp", "cmp_diff")):
+            c = per_dir[(feat, tdir)][ti]
+            c[0] += 1
+            c[1] += field in r
         for f, ls in r["lines"].items():
             d = per_line[f]
             for ln in ls:
@@ -49,11 +63,25 @@ def main():
             for a in r["attr_reads"]:
                 attr_reads[a].add(ti)
             attr_import.update(r["attr_import"])
+        if "ev" in r:
+            has_ev.add(ti)
+            for k in r["ev"]:
+                ev[k].add(ti)
+            ev_import.update(r["ev_import"])
         if "cmp_diff" in r:
+            has_cmp.add(ti)
             have_cmp = True
             for k in r["cmp_diff"]:
                 cmp_diff[k].add(ti)
             cmp_import.update(r["cmp_import"])
+        if "dict_keys" in r:
+            has_dict.add(ti)
+            have_dict = True
+            for k in r["dict_keys"]:
+                dkeys[k].add(ti)
+            for k in r["dict_all"]:
+                dall[k].add(ti)
+            dimport.update(r["dict_import"])
     sets = {}
     set_list = []
 
@@ -75,6 +103,23 @@ def main():
         "lambdas": {k: sid(ts) for k, ts in lambdas.items()},
         "modules": {k: sid(ts) for k, ts in modules.items()},
     }
+    all_t = set(range(len(ids)))
+    complete = collections.defaultdict(set)
+    for (feat, _d), tests_ in per_dir.items():
+        for ti_, (n_, k_) in tests_.items():
+            if n_ and n_ == k_:
+                complete[feat].add(ti_)
+    if has_ev:
+        data["ev"] = {k: sid(ts) for k, ts in ev.items()}
+        data["ev_import"] = sorted(ev_import)
+        data["ev_unknown"] = sorted(all_t - complete["ev"])
+    if have_cmp:
+        data["cmp_unknown"] = sorted(all_t - complete["cmp"])
+    if have_dict:
+        data["dict_unknown"] = sorted(all_t - complete["dict"])
+        data["dkeys"] = {k: sid(ts) for k, ts in dkeys.items()}
+        data["dall"] = {k: sid(ts) for k, ts in dall.items()}
+        data["dimport"] = sorted(dimport)
     if have_cmp:
         data["cmp"] = {k: sid(ts) for k, ts in cmp_diff.items()}
         data["cmp_import"] = sorted(cmp_import)

@@ -22,6 +22,8 @@ def start(test=None):
     lines, opened, seen = {}, set(), set()
     attr_reads, attr_import = set(), set()
     cmp_diff, cmp_import = set(), set()
+    dict_keys, dict_all, dict_import = set(), set(), set()
+    ev_sites, ev_import = set(), set()
     recv_codes, seen_types, receivers, lambdas = set(), set(), set(), set()
     modules = set()
     getframe = sys._getframe
@@ -105,12 +107,18 @@ def start(test=None):
             "attr_import": sorted(attr_import),
             "cmp_diff": sorted(cmp_diff),
             "cmp_import": sorted(cmp_import),
+            "dict_keys": sorted(dict_keys),
+            "dict_all": sorted(dict_all),
+            "dict_import": sorted(dict_import),
+            "ev": sorted(ev_sites),
+            "ev_import": sorted(ev_import),
         }
         with open(f"{out_dir}/{test}.{os.getpid()}.json", "w") as f:
             json.dump(rec, f)
 
     if os.environ.get("BR_TRACE_ATTRS"):
-        _install_attr_tracer(depth, attr_reads, attr_import, cmp_diff, cmp_import)
+        _install_attr_tracer(depth, attr_reads, attr_import, cmp_diff, cmp_import,
+                             (dict_keys, dict_all, dict_import), (ev_sites, ev_import))
 
     _state["dump"] = dump
     _state["depth"] = depth
@@ -145,7 +153,36 @@ CMP_ALTS = {
 }
 
 
-def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=None):
+def keyreprs(k):
+    import enum
+    if isinstance(k, enum.Enum):
+        out = {f"e:{k.name}"}
+        if isinstance(k, str):
+            out.add(f"s:{str.__str__(k)}")
+        elif isinstance(k, int) and not isinstance(k, bool):
+            out.add(f"i:{int(k)}")
+        return out
+    return {keyrepr(k)}
+
+
+def keyrepr(k):
+    import enum
+    if isinstance(k, bool) or k is None:
+        return f"c:{k!r}"
+    if isinstance(k, enum.Enum):
+        return f"e:{k.name}"
+    if isinstance(k, str):
+        return f"s:{k}"
+    if isinstance(k, int):
+        return f"i:{k}"
+    if isinstance(k, type):
+        return f"t:{k.__name__}"
+    if isinstance(k, tuple):
+        return "u:" + "|".join(keyrepr(x) for x in k)
+    return f"o:{type(k).__name__}"
+
+
+def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=None, dicts=None, evs=None):
     import ast
     import builtins
     import enum
@@ -241,6 +278,183 @@ def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=N
         return r
 
     builtins.__br_cmp__ = br_cmp
+    d_keys, d_all, d_import = dicts if dicts else (set(), set(), set())
+
+    class TracingDict(dict):
+        __slots__ = ("_br_owner", "_br_prov")
+
+        def _rec_key(self, k):
+            try:
+                krs = keyreprs(k)
+            except Exception:  # noqa: BLE001
+                krs = {"o:?"}
+            prov = self._br_prov
+            if depth[0]:
+                origins = {prov.get(k, self._br_owner)} if dict.__contains__(self, k) else set(prov.values()) | {self._br_owner}
+                for o in origins:
+                    d_import.add(f"{o}|get")
+                return
+            if dict.__contains__(self, k):
+                o = prov.get(k, self._br_owner)
+                for kr in krs:
+                    d_keys.add(f"{o}|{kr}")
+            else:
+                for o in set(prov.values()) | {self._br_owner}:
+                    for kr in krs:
+                        d_keys.add(f"{o}|{kr}")
+
+        def _rec_all(self, mode):
+            target = d_import if depth[0] else d_all
+            for o in set(self._br_prov.values()) | {self._br_owner}:
+                target.add(f"{o}|{mode}")
+
+        def __getitem__(self, k):
+            self._rec_key(k)
+            return dict.__getitem__(self, k)
+
+        def get(self, k, default=None):
+            self._rec_key(k)
+            return dict.get(self, k, default)
+
+        def __contains__(self, k):
+            self._rec_key(k)
+            return dict.__contains__(self, k)
+
+        def setdefault(self, k, default=None):
+            self._rec_key(k)
+            return dict.setdefault(self, k, default)
+
+        def pop(self, k, *a):
+            self._rec_key(k)
+            return dict.pop(self, k, *a)
+
+        def __iter__(self):
+            self._rec_all("keys")
+            return dict.__iter__(self)
+
+        def keys(self):
+            self._rec_all("keys")
+            return dict.keys(self)
+
+        def __len__(self):
+            return dict.__len__(self)
+
+        def values(self):
+            self._rec_all("vals")
+            return dict.values(self)
+
+        def items(self):
+            self._rec_all("vals")
+            return dict.items(self)
+
+        def __eq__(self, other):
+            self._rec_all("vals")
+            return dict.__eq__(self, other)
+
+        __hash__ = None
+
+        def __ne__(self, other):
+            self._rec_all("vals")
+            return dict.__ne__(self, other)
+
+        def __repr__(self):
+            self._rec_all("vals")
+            return dict.__repr__(self)
+
+        def __reduce_ex__(self, proto):
+            self._rec_all("vals")
+            return (dict, (dict(dict.items(self)),))
+
+        def copy(self):
+            return _clone(self)
+
+        def __or__(self, other):
+            r = _clone(self)
+            r.update(other)
+            return r
+
+        def __ror__(self, other):
+            r = make_td(self._br_owner, [("s", other), ("s", self)])
+            return r
+
+        def update(self, *a, **kw):
+            for src in a:
+                if isinstance(src, TracingDict):
+                    for k in dict.keys(src):
+                        dict.__setitem__(self, k, dict.__getitem__(src, k))
+                        self._br_prov[k] = src._br_prov.get(k, src._br_owner)
+                else:
+                    for k, v in (src.items() if hasattr(src, "items") else src):
+                        dict.__setitem__(self, k, v)
+                        self._br_prov[k] = self._br_owner
+            for k, v in kw.items():
+                dict.__setitem__(self, k, v)
+                self._br_prov[k] = self._br_owner
+
+        def __setitem__(self, k, v):
+            dict.__setitem__(self, k, v)
+            self._br_prov[k] = self._br_owner
+
+    def _clone(td):
+        r = TracingDict()
+        r._br_owner = td._br_owner
+        r._br_prov = dict(td._br_prov)
+        dict.update(r, dict.items(td))
+        for k in dict.keys(td):
+            r._br_prov.setdefault(k, td._br_owner)
+        return r
+
+    def make_td(owner, parts):
+        r = TracingDict()
+        r._br_owner = owner
+        r._br_prov = {}
+        for part in parts:
+            if part[0] == "s":
+                src = part[1]
+                if isinstance(src, TracingDict):
+                    for k in dict.keys(src):
+                        dict.__setitem__(r, k, dict.__getitem__(src, k))
+                        r._br_prov[k] = src._br_prov.get(k, src._br_owner)
+                else:
+                    for k in src.keys():
+                        dict.__setitem__(r, k, src[k])
+                        r._br_prov[k] = f"{owner}+spread"
+            else:
+                dict.__setitem__(r, part[1], part[2])
+                r._br_prov[part[1]] = owner
+        return r
+
+    def br_tdict(owner, parts):
+        d_import.add(f"{owner}|created")
+        return make_td(owner, parts)
+
+    _real_dict = dict
+
+    def br_dict(*a, **kw):
+        if len(a) == 1 and not kw and isinstance(a[0], TracingDict):
+            return _clone(a[0])
+        return _real_dict(*a, **kw)
+
+    builtins.__br_tdict__ = br_tdict
+    ev_set, ev_imp = evs if evs else (set(), set())
+    ev_seen = set()
+
+    def br_ev(site, value):
+        # operand `site` was evaluated (short-circuit not taken); with a truthiness tag
+        try:
+            tag = "T" if value else "F"
+        except Exception:  # noqa: BLE001
+            tag = "?"
+        key = f"{site}|{tag}"
+        if key not in ev_seen:
+            ev_seen.add(key)
+            (ev_imp if depth[0] else ev_set).add(key)
+        elif depth[0] == 0 and key not in ev_set:
+            ev_set.add(key)
+        return value
+
+    builtins.__br_ev__ = br_ev
+    builtins.__br_dict__ = br_dict
     builtins.__br_ga__ = br_ga
     builtins.__br_getattr__ = br_getattr
     builtins.__br_hasattr__ = br_hasattr
@@ -248,6 +462,56 @@ def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=N
     class Xform(ast.NodeTransformer):
         def __init__(self, rel=None):
             self.rel = rel
+
+        def wrap_dicts(self, body, owner_prefix):
+            for st in body:
+                if isinstance(st, (ast.Assign, ast.AnnAssign)) and isinstance(st.value, ast.Dict):
+                    tg = st.targets if isinstance(st, ast.Assign) else [st.target]
+                    if len(tg) == 1 and isinstance(tg[0], ast.Name):
+                        d = st.value
+                        parts = []
+                        for k, v in zip(d.keys, d.values):
+                            if k is None:
+                                parts.append(ast.Tuple([ast.Constant("s"), v], ast.Load()))
+                            else:
+                                parts.append(ast.Tuple([ast.Constant("k"), k, v], ast.Load()))
+                        call = ast.Call(func=ast.Name("__br_tdict__", ast.Load()),
+                                        args=[ast.Constant(f"{owner_prefix}:{tg[0].id}"), ast.List(parts, ast.Load())],
+                                        keywords=[])
+                        st.value = ast.copy_location(call, d)
+                if isinstance(st, ast.ClassDef):
+                    qual = st.name if owner_prefix.count(":") == 1 and owner_prefix.endswith(":") else None
+                    base_mod = owner_prefix.split(":")[0]
+                    cur_qual = owner_prefix.split(":", 1)[1] if ":" in owner_prefix else ""
+                    new_qual = f"{cur_qual}.{st.name}" if cur_qual else st.name
+                    self.wrap_dicts(st.body, f"{base_mod}:{new_qual}")
+
+        def visit_Module(self, node):
+            if self.rel and dicts is not None:
+                mod = self.rel[:-3].replace("/", ".")
+                if mod.endswith(".__init__"):
+                    mod = mod[: -len(".__init__")]
+                self.wrap_dicts(node.body, f"{mod}:")
+            self.generic_visit(node)
+            return node
+
+        def _ev(self, node):
+            site = f"{self.rel}:{node.lineno}:{node.col_offset}"
+            new = ast.Call(func=ast.Name("__br_ev__", ast.Load()), args=[ast.Constant(site), node], keywords=[])
+            return ast.copy_location(new, node)
+
+        def visit_BoolOp(self, node):
+            self.generic_visit(node)
+            if self.rel and evs is not None:
+                node.values = [self._ev(v) for v in node.values]
+            return node
+
+        def visit_IfExp(self, node):
+            self.generic_visit(node)
+            if self.rel and evs is not None:
+                node.body = self._ev(node.body)
+                node.orelse = self._ev(node.orelse)
+            return node
 
         def visit_Compare(self, node):
             self.generic_visit(node)
@@ -287,6 +551,9 @@ def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=N
         def visit_Call(self, node):
             self.generic_visit(node)
             f = node.func
+            if isinstance(f, ast.Name) and f.id == "dict" and dicts is not None:
+                node.func = ast.copy_location(ast.Name("__br_dict__", ast.Load()), f)
+                return node
             if (isinstance(f, ast.Name) and f.id in ("getattr", "hasattr") and len(node.args) >= 2
                     and isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str)
                     and UPPER.match(node.args[1].value)):
@@ -303,7 +570,7 @@ def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=N
             st = os.stat(self.path)
             cpath = None
             if cache_dir:
-                h = hashlib.sha1(f"{self.path}|{st.st_mtime_ns}|{st.st_size}|v2".encode()).hexdigest()
+                h = hashlib.sha1(f"{self.path}|{st.st_mtime_ns}|{st.st_size}|v4".encode()).hexdigest()
                 cpath = os.path.join(cache_dir, h)
                 try:
                     with open(cpath, "rb") as f:
