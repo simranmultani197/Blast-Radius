@@ -22,6 +22,7 @@ def start(test=None):
     lines, opened, seen = {}, set(), set()
     attr_reads, attr_import = set(), set()
     cmp_diff, cmp_import = set(), set()
+    cmp_import_diff = set()
     dict_keys, dict_all, dict_import = set(), set(), set()
     ev_sites, ev_import = set(), set()
     recv_codes, seen_types, receivers, lambdas = set(), set(), set(), set()
@@ -108,6 +109,7 @@ def start(test=None):
             "attr_import": sorted(attr_import),
             "cmp_diff": sorted(cmp_diff),
             "cmp_import": sorted(cmp_import),
+            "cmp_import_diff": sorted(cmp_import_diff),
             "dict_keys": sorted(dict_keys),
             "dict_all": sorted(dict_all),
             "dict_import": sorted(dict_import),
@@ -122,7 +124,7 @@ def start(test=None):
 
     if os.environ.get("BR_TRACE_ATTRS"):
         _install_attr_tracer(depth, attr_reads, attr_import, cmp_diff, cmp_import,
-                             (dict_keys, dict_all, dict_import), (ev_sites, ev_import))
+                             (dict_keys, dict_all, dict_import), (ev_sites, ev_import), cmp_import_diff)
 
     if os.environ.get("BR_TRACE_ERRMSG"):
         _install_errmsg_hook(depth, errmsg, errmsg_import)
@@ -238,7 +240,8 @@ def keyrepr(k):
     return f"o:{type(k).__name__}"
 
 
-def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=None, dicts=None, evs=None):
+def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=None, dicts=None, evs=None,
+                         cmp_import_diff=None):
     import ast
     import builtins
     import enum
@@ -318,10 +321,18 @@ def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=N
             return r
         if depth[0]:
             cmp_import.add(site)
-            return r
-        seen = done_alts.get(site)
-        if seen is None:
-            seen = done_alts[site] = set()
+            if cmp_import_diff is None:
+                return r
+            # which alternative operators would change an import-time outcome
+            seen = done_alts.get(("import", site))
+            if seen is None:
+                seen = done_alts[("import", site)] = set()
+            sink = cmp_import_diff
+        else:
+            seen = done_alts.get(site)
+            if seen is None:
+                seen = done_alts[site] = set()
+            sink = cmp_diff
         alts = CMP_ALTS[op]
         if len(seen) == len(alts):
             return r
@@ -335,7 +346,7 @@ def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=N
                 same = False
             if not same:
                 seen.add(alt)
-                cmp_diff.add(f"{site}|{alt}")
+                sink.add(f"{site}|{alt}")
         return r
 
     builtins.__br_cmp__ = br_cmp

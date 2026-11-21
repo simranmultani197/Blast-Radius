@@ -32,6 +32,7 @@ def main():
     have_dict = False
     ev = collections.defaultdict(set)
     ev_import = set()
+    cmp_import_diff, cmp_import_traced = set(), set()
     errmsg = collections.defaultdict(set)
     errmsg_import = set()
     has_errmsg = False
@@ -44,7 +45,7 @@ def main():
         r = json.load(open(p))
         ti = index[num_to_id[r["test"]]]
         tdir = os.path.dirname(p)
-        for feat, field in (("dict", "dict_keys"), ("ev", "ev"), ("cmp", "cmp_diff"), ("errmsg", "errmsg")):
+        for feat, field in (("dict", "dict_keys"), ("ev", "ev"), ("cmp", "cmp_diff"), ("errmsg", "errmsg"), ("cmpi", "cmp_import_diff")):
             c = per_dir[(feat, tdir)][ti]
             c[0] += 1
             c[1] += field in r
@@ -71,6 +72,9 @@ def main():
             for k in r["ev"]:
                 ev[k].add(ti)
             ev_import.update(r["ev_import"])
+        if "cmp_import_diff" in r:
+            cmp_import_diff.update(r["cmp_import_diff"])
+            cmp_import_traced.update(r["cmp_import"])
         if "errmsg" in r:
             has_errmsg = True
             for k in r["errmsg"]:
@@ -121,6 +125,10 @@ def main():
         data["ev"] = {k: sid(ts) for k, ts in ev.items()}
         data["ev_import"] = sorted(ev_import)
         data["ev_unknown"] = sorted(all_t - complete["ev"])
+    if cmp_import_traced and complete["cmpi"] == all_t:
+        # every test's imports were traced with per-alternative outcomes
+        data["cmp_import_diff"] = sorted(cmp_import_diff)
+        data["cmp_import_traced"] = sorted(cmp_import_traced)
     if has_errmsg:
         data["errmsg"] = {k: sid(ts) for k, ts in errmsg.items()}
         data["errmsg_import"] = sorted(errmsg_import)

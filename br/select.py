@@ -50,6 +50,9 @@ class CovMap:
         self.ev_import = set(d.get("ev_import", []))
         self.cmp = d.get("cmp")
         self.cmp_import = set(d.get("cmp_import", []))
+        cid = d.get("cmp_import_diff")
+        self.cmp_import_diff = set(cid) if cid is not None else None
+        self.cmp_import_traced = set(d.get("cmp_import_traced", []))
         self.errmsg = d.get("errmsg")
         self.errmsg_import = set(d.get("errmsg_import", []))
         self.errmsg_unknown = frozenset(d.get("errmsg_unknown", []))
@@ -192,7 +195,7 @@ def analyze_py(path, old_src, new_src, fp: P.FilePatch, cmap: CovMap, ch: Change
         if sw is not None:
             line, col, old_op, new_op = sw
             site = f"{path}:{line}:{col}"
-            if site not in cmap.cmp_import and new_op in CMP_ALTS.get(old_op, ()):
+            if _import_safe_cmp(cmap, site, new_op) and new_op in CMP_ALTS.get(old_op, ()):
                 sid = cmap.cmp.get(f"{site}|{new_op}")
                 tests = set(cmap.set(sid)) if sid is not None else set()
                 if cmap.cmp_unknown:
@@ -276,6 +279,17 @@ def _near(path, fi, before, after, cmap, ch):
         ch.add(cmap.file_tests(path), f"{path}:{before} unplaced")
         ch.broad = True
 
+
+def _import_safe_cmp(cmap, site, new_op):
+    """A comparison that also runs at import is safe to judge by its runtime
+    outcomes when no import-time evaluation would change under new_op."""
+    if site not in cmap.cmp_import:
+        return True
+    return CMP_IMPORT_RULE and cmap.cmp_import_diff is not None and site in cmap.cmp_import_traced \
+        and f"{site}|{new_op}" not in cmap.cmp_import_diff
+
+
+CMP_IMPORT_RULE = True
 
 CMP_ALTS = {
     "Eq": ["NotEq", "Is", "IsNot"], "NotEq": ["Eq", "Is", "IsNot"],
@@ -400,7 +414,7 @@ def expression_rules(cmap, path, old_tree, new_tree, ch):
         if sw is not None:
             line, col, old_op, new_op = sw
             site = f"{path}:{line}:{col}"
-            if site not in cmap.cmp_import and new_op in CMP_ALTS.get(old_op, ()):
+            if _import_safe_cmp(cmap, site, new_op) and new_op in CMP_ALTS.get(old_op, ()):
                 sid = cmap.cmp.get(f"{site}|{new_op}")
                 tests = set(cmap.set(sid)) if sid is not None else set()
                 tests |= executors & cmap.cmp_unknown

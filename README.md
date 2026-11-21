@@ -48,6 +48,13 @@ Per changed file:
   class at runtime. Otherwise tests that used the class or a subclass, or any
   dialect it belongs to, plus import-time copies found by the xref index.
   Enums and unknown classes fall back to every importer.
+- **Comparison operator swap** (`<` → `<=`, `is` → `==`, ...): the tracer
+  evaluates every alternative operator at each comparison and records, per
+  test, where the outcome would differ, so only those tests are selected. For
+  comparisons that also run while modules are imported, it also records which
+  alternatives would change an import-time outcome. If the new operator changes
+  none, import is unaffected and the runtime outcomes decide. Otherwise every
+  importer is selected.
 - **Value edit in a class's `arg_types` dict** (e.g. `"this": True` →
   `False`): the values are read only by `Expr.__init_subclass__` (into
   `required_args`) and by `**Other.arg_types` spreads, and `required_args` only
