@@ -252,6 +252,11 @@ def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=N
     done_alts = {}
 
     def br_cmp(site, a, b, op):
+        if op not in ("Is", "IsNot"):
+            ta = type(a).__name__ in ("TracingSet", "TracingDict", "TracingFrozenSet")
+            tb = type(b).__name__ in ("TracingSet", "TracingDict", "TracingFrozenSet")
+            if ta != tb:
+                (builtins.__br_consume__)(a if ta else b)
         r = OPF[op](a, b)
         if cmp_diff is None:
             return r
@@ -652,6 +657,48 @@ def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=N
                 r._br_prov.setdefault(e, _origin(p, e, r._br_owner))
         return r
 
+    _SET_METHODS = {"update", "union", "difference", "intersection", "symmetric_difference",
+                    "issubset", "issuperset", "isdisjoint", "difference_update", "intersection_update",
+                    "symmetric_difference_update"}
+
+    def _consume(*xs):
+        """A traced container read wholesale by C code (e.g. plain_set - traced_set)."""
+        target = d_import if depth[0] else d_all
+        for x in xs:
+            if isinstance(x, TracingSet):
+                for o in x._br_family:
+                    target.add(f"{o}|keys")
+            elif isinstance(x, TracingDict):
+                for o in set(x._br_prov.values()) | {x._br_owner}:
+                    target.add(f"{o}|keys")
+
+    import operator as _op
+    _BINOPS = {"Sub": _op.sub, "BitOr": _op.or_, "BitAnd": _op.and_, "BitXor": _op.xor}
+    _IOPS = {"Sub": _op.isub, "BitOr": _op.ior, "BitAnd": _op.iand, "BitXor": _op.ixor}
+
+    def br_bin(op, a, b):
+        if isinstance(b, (TracingSet, TracingDict)) and not isinstance(a, (TracingSet, TracingDict)):
+            _consume(b)
+        elif isinstance(a, (TracingSet, TracingDict)) and not isinstance(b, (TracingSet, TracingDict)) \
+                and not isinstance(a, TracingSet):
+            _consume(a)
+        return _BINOPS[op](a, b)
+
+    def br_iop(op, a, b):
+        if isinstance(b, (TracingSet, TracingDict)) and not isinstance(a, TracingSet):
+            _consume(b)
+        return _IOPS[op](a, b)
+
+    def br_meth(obj, name, *args, **kw):
+        if not isinstance(obj, TracingSet) and any(isinstance(x, (TracingSet, TracingDict)) for x in args):
+            if isinstance(obj, (set, frozenset)) or obj is set or obj is frozenset:
+                _consume(*args)
+        return getattr(obj, name)(*args, **kw)
+
+    builtins.__br_consume__ = _consume
+    builtins.__br_bin__ = br_bin
+    builtins.__br_iop__ = br_iop
+    builtins.__br_meth__ = br_meth
     builtins.__br_tset__ = br_tset
     builtins.__br_set__ = br_set
     builtins.__br_frozenset__ = br_frozenset
@@ -756,6 +803,27 @@ def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=N
                 node.orelse = self._ev(node.orelse)
             return node
 
+        def visit_BinOp(self, node):
+            self.generic_visit(node)
+            name = type(node.op).__name__
+            if self.rel and dicts is not None and name in ("Sub", "BitOr", "BitAnd", "BitXor"):
+                new = ast.Call(func=ast.Name("__br_bin__", ast.Load()),
+                               args=[ast.Constant(name), node.left, node.right], keywords=[])
+                return ast.copy_location(new, node)
+            return node
+
+        def visit_AugAssign(self, node):
+            self.generic_visit(node)
+            name = type(node.op).__name__
+            if self.rel and dicts is not None and name in ("Sub", "BitOr", "BitAnd", "BitXor") \
+                    and isinstance(node.target, ast.Name):
+                load = ast.copy_location(ast.Name(node.target.id, ast.Load()), node.target)
+                call = ast.Call(func=ast.Name("__br_iop__", ast.Load()),
+                                args=[ast.Constant(name), load, node.value], keywords=[])
+                new = ast.Assign(targets=[node.target], value=ast.copy_location(call, node))
+                return ast.copy_location(new, node)
+            return node
+
         def visit_Set(self, node):
             self.generic_visit(node)
             if self.rel and dicts is not None and any(isinstance(e, ast.Starred) for e in node.elts):
@@ -807,6 +875,14 @@ def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=N
             if isinstance(f, ast.Name) and f.id == "dict" and dicts is not None:
                 node.func = ast.copy_location(ast.Name("__br_dict__", ast.Load()), f)
                 return node
+            if isinstance(f, ast.Attribute) and f.attr in ("update", "union", "difference", "intersection",
+                                                             "symmetric_difference", "issubset", "issuperset",
+                                                             "isdisjoint", "difference_update", "intersection_update",
+                                                             "symmetric_difference_update") \
+                    and dicts is not None and self.rel and not any(isinstance(a, ast.Starred) for a in node.args):
+                new = ast.Call(func=ast.Name("__br_meth__", ast.Load()),
+                               args=[f.value, ast.Constant(f.attr), *node.args], keywords=node.keywords)
+                return ast.copy_location(new, node)
             if isinstance(f, ast.Name) and f.id in ("set", "frozenset") and dicts is not None:
                 node.func = ast.copy_location(ast.Name(f"__br_{f.id}__", ast.Load()), f)
                 return node
@@ -826,7 +902,7 @@ def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=N
             st = os.stat(self.path)
             cpath = None
             if cache_dir:
-                h = hashlib.sha1(f"{self.path}|{st.st_mtime_ns}|{st.st_size}|v5".encode()).hexdigest()
+                h = hashlib.sha1(f"{self.path}|{st.st_mtime_ns}|{st.st_size}|v6".encode()).hexdigest()
                 cpath = os.path.join(cache_dir, h)
                 try:
                     with open(cpath, "rb") as f:

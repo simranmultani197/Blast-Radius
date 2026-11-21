@@ -41,6 +41,8 @@ class CovMap:
         self.dall = d.get("dall", {})
         self.dimport = set(d.get("dimport", []))
         self.keyed_import = any("|getk|" in x for x in self.dimport)
+        self.consumed_ok = d.get("set_consumption_traced", False)
+        self._runtime_origins = None
         self.ev = d.get("ev")
         self.ev_unknown = frozenset(d.get("ev_unknown", []))
         self.cmp_unknown = frozenset(d.get("cmp_unknown", []))
@@ -49,6 +51,12 @@ class CovMap:
         self.cmp = d.get("cmp")
         self.cmp_import = set(d.get("cmp_import", []))
         self.all = frozenset(range(len(self.tests)))
+
+    def runtime_origins(self):
+        if self._runtime_origins is None:
+            self._runtime_origins = {k.split("|", 1)[0] for k in (self.dkeys or {})} | \
+                {k.split("|", 1)[0] for k in self.dall}
+        return self._runtime_origins
 
     def recv_tests(self, key):
         sid = self.receivers.get(key)
@@ -519,7 +527,7 @@ def dict_rule(cmap, path, u, line, cols, new_tree):
 
 # Off: a plain set on the left of `-`/`|` (or set.update(...)) copies a traced
 # set in C without calling its methods, so lookups can go unrecorded.
-SET_RULE = False
+SET_RULE = True
 
 
 def set_rule(cmap, path, u, line, cols, new_tree):
@@ -533,6 +541,10 @@ def set_rule(cmap, path, u, line, cols, new_tree):
     mod = A.module_name(path)
     origin = f"{mod}:{u.qual}:{tg[0].id}" if u.scope == "class" else f"{mod}::{tg[0].id}"
     if f"{origin}|created" not in cmap.dimport or f"{origin}|keys" in cmap.dimport:
+        return None
+    if not cmap.consumed_ok or origin not in cmap.runtime_origins():
+        # no recorded runtime use of the traced set itself: it may only be
+        # reached through a copy we could not see
         return None
     c0, c1 = cols
     hit = None

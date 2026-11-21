@@ -120,6 +120,7 @@ def main():
         data["dkeys"] = {k: sid(ts) for k, ts in dkeys.items()}
         data["dall"] = {k: sid(ts) for k, ts in dall.items()}
         data["dimport"] = sorted(dimport)
+        data["set_consumption_traced"] = os.environ.get("BR_SET_CONSUMPTION") == "1"
     if have_cmp:
         data["cmp"] = {k: sid(ts) for k, ts in cmp_diff.items()}
         data["cmp_import"] = sorted(cmp_import)
