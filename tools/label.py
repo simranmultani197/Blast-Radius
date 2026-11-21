@@ -42,19 +42,45 @@ def start(pf, slot):
         else:
             open(f"{w}/{fp.path}", "w", encoding="utf-8", newline="").write(new)
     env = dict(os.environ, SKIP_INTEGRATION="0", PYTHONPATH=f"{w}:/repo/tools", BR_LABEL_OUT=pf[:-6] + ".truth.json")
+    nodes = os.environ.get("BR_LABEL_NODES")
+    targets = ["tests"]
+    if nodes:
+        sel = json.load(open(pf[:-6] + ".cands.json"))
+        targets = sel or []
+        if not targets:
+            json.dump({"failing": [], "collect_errors": [], "exit": 5}, open(pf[:-6] + ".truth.json", "w"))
+            return subprocess.Popen(["true"])
     return subprocess.Popen(
-        [sys.executable, "-m", "pytest", "tests", "-q", "-p", "no:cacheprovider", "-p", "label_plugin",
-         "--timeout=120", "-x" if False else "-q"],
-        cwd=w, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        [sys.executable, "-m", "pytest", *targets, "-q", "-p", "no:cacheprovider", "-p", "label_plugin",
+         "--timeout=120"],
+        cwd=w, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
 
+LIMIT = float(os.environ.get("BR_LABEL_LIMIT", "900"))
+started = {}
+procs = {}
 while todo or running:
     while todo and slot_free:
         slot = slot_free.pop()
         pf = todo.pop(0)
-        running[start(pf, slot).pid] = (pf, slot)
-    pid, _ = os.wait()
-    if pid in running:
+        pr = start(pf, slot)
+        running[pr.pid] = (pf, slot)
+        started[pr.pid] = time.time()
+        procs[pr.pid] = pr
+    time.sleep(0.5)
+    for pid in list(running):
+        pr = procs[pid]
+        if pr.poll() is None and time.time() - started[pid] > LIMIT:
+            import signal
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            pr.wait()
+            pf = running[pid][0]
+            json.dump({"failing": None, "timeout": True}, open(pf[:-6] + ".truth.json", "w"))
+        if pr.poll() is None:
+            continue
         pf, slot = running.pop(pid)
         slot_free.append(slot)
         done += 1

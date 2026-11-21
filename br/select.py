@@ -28,6 +28,10 @@ class CovMap:
         self.attr_reads = d.get("attr_reads")
         self.attr_import = set(d.get("attr_import", []))
         self.str_names = set(d.get("str_names", []))
+        self.du = d.get("du")
+        self.du_strings = set(self.du["strings"]) if self.du else set()
+        self.cmp = d.get("cmp")
+        self.cmp_import = set(d.get("cmp_import", []))
         self.all = frozenset(range(len(self.tests)))
 
     def recv_tests(self, key):
@@ -139,16 +143,28 @@ def analyze_py(path, old_src, new_src, fp: P.FilePatch, cmap: CovMap, ch: Change
         ch.add(cmap.file_tests(path), f"deleted {path}")
         ch.broad = True
         return
-    same = A.same_ast(old_src, new_src)
+    old_tree = _parse_cached(path, old_src)
+    new_tree = A.parse(new_src)
+    same = A.same_ast(old_src, new_src, old_tree, new_tree)
     if same:
         ch.notes.append(f"{path}: same AST")
         return
-    if A.parse(new_src) is None:
+    if new_tree is None:
         ch.syntax_error = True
         ch.add(cmap.file_tests(path), f"syntax error {path}")
         ch.broad = True
         return
-    fi = A.FileIndex(old_src)
+    if cmap.cmp is not None:
+        sw = A.single_compare_swap(old_tree, new_tree)
+        if sw is not None:
+            line, col, old_op, new_op = sw
+            site = f"{path}:{line}:{col}"
+            if site not in cmap.cmp_import and new_op in CMP_ALTS.get(old_op, ()):
+                sid = cmap.cmp.get(f"{site}|{new_op}")
+                ch.add(cmap.set(sid) if sid is not None else (), f"{site} {old_op}->{new_op}")
+                ch.notes.append(f"compare rule {site} {old_op}->{new_op}")
+                return
+    fi = _index_cached(path, old_src, old_tree)
     removed, inserts = P.changed_old_lines(fp)
     ins_text = _inserted_text(fp)
     cols = _changed_cols(fp)
@@ -204,6 +220,13 @@ def _near(path, fi, before, after, cmap, ch):
         ch.add(cmap.file_tests(path), f"{path}:{before} unplaced")
         ch.broad = True
 
+
+CMP_ALTS = {
+    "Eq": ["NotEq", "Is", "IsNot"], "NotEq": ["Eq", "Is", "IsNot"],
+    "Is": ["IsNot", "Eq", "NotEq"], "IsNot": ["Is", "Eq", "NotEq"],
+    "Lt": ["LtE", "Gt", "GtE", "Eq", "NotEq"], "LtE": ["Lt", "Gt", "GtE", "Eq", "NotEq"],
+    "Gt": ["GtE", "Lt", "LtE", "Eq", "NotEq"], "GtE": ["Gt", "Lt", "LtE", "Eq", "NotEq"],
+}
 
 REGISTRY_ATTRS = {"_sql_names", "key", "__name__", "__qualname__", "__slots__", "__init_subclass__"}
 
@@ -269,8 +292,78 @@ def _scope_rule(path, fi, u, cmap, ch, why, attrs=None):
             ch.add(tests, why + f" class {u.qual}")
             ch.notes.append(f"class rule {ckey} {sorted(names)}")
             return
+    if u.scope == "module" and cmap.du is not None and attrs is None:
+        names = A.assigned_names(u.node)
+        simple = isinstance(u.node, (ast.Assign, ast.AnnAssign)) and all(
+            isinstance(t, ast.Name) for t in (u.node.targets if isinstance(u.node, ast.Assign) else [u.node.target]))
+        if simple and names and not _uses_globals(fi):
+            tests = module_rule(cmap, A.module_name(path), names, set())
+            if tests is not None:
+                ch.add(tests, why + f" module names {sorted(names)}")
+                ch.notes.append(f"module rule {A.module_name(path)} {sorted(names)}")
+                return
     ch.add(cmap.span_tests(path, u.start, u.end), why + " importers")
     ch.broad = True
+
+
+def _uses_globals(fi):
+    for n in ast.walk(fi.tree):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("globals", "vars", "locals") \
+                and not n.args:
+            return True
+    return False
+
+
+def _module_of(file):
+    return A.module_name(file)
+
+
+def module_rule(cmap, mod, names, visited, depth=0):
+    """Tests that can observe a change to module-level names, following uses
+    through imports and re-exports. None when something escapes the analysis."""
+    du = cmap.du
+    if depth > 8:
+        return None
+    out = set()
+    for n in names:
+        if n == "?" or n in cmap.du_strings or n.startswith("__"):
+            return None
+        keys, stack = set(), [f"{mod}:{n}"]
+        while stack:
+            k = stack.pop()
+            if k in keys:
+                continue
+            keys.add(k)
+            stack.extend(du["aliases"].get(k, []))
+            m, name = k.split(":", 1)
+            if not name.startswith("_"):
+                for star in du["aliases"].get(f"{m}:*", []):
+                    stack.append(f"{star.split(':', 1)[0]}:{name}")
+        for k in keys:
+            if k in visited:
+                continue
+            visited.add(k)
+            for file, s0, s1, kind, extra in du["refs"].get(k, []):
+                if kind == "f":
+                    out |= cmap.span_tests(file, s0, s1)
+                elif kind == "l":
+                    out |= cmap.lambda_tests(file, s0)
+                elif kind == "c":
+                    qual, tg = extra
+                    if "?" in tg:
+                        return None
+                    t = class_tests(cmap, f"{_module_of(file)}:{qual}", set(tg), None, file)
+                    if t is None:
+                        return None
+                    out |= t
+                elif kind == "m":
+                    if "?" in extra:
+                        return None
+                    sub = module_rule(cmap, _module_of(file), set(extra), visited, depth + 1)
+                    if sub is None:
+                        return None
+                    out |= sub
+    return out
 
 
 def class_tests(cmap, ckey, names, cls_node, path, depth=0):
@@ -336,6 +429,26 @@ def _changed_cols(fp: P.FilePatch):
                     out[old + k] = (pre, max(pre, len(ab) - suf))
             old += len(dels)
     return out
+
+
+_TREES = {}
+_INDEX = {}
+
+
+def _parse_cached(path, src):
+    """Old (pinned) sources never change, so parse each file once per run.
+    The cached tree is only read, never modified."""
+    t = _TREES.get(path)
+    if t is None:
+        t = _TREES[path] = A.parse(src)
+    return t
+
+
+def _index_cached(path, src, tree):
+    fi = _INDEX.get(path)
+    if fi is None:
+        fi = _INDEX[path] = A.FileIndex(src, tree)
+    return fi
 
 
 def _name_changed(n, new_src):

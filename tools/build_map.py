@@ -23,6 +23,9 @@ def main():
     attr_reads = collections.defaultdict(set)
     attr_import = set()
     have_attrs = False
+    cmp_diff = collections.defaultdict(set)
+    cmp_import = set()
+    have_cmp = False
     num_to_id = {str(t["number"]): t["id"] for t in tests}
     paths = [p for d in trace_dir.split(",") for p in glob.glob(f"{d}/*.*.json")]
     for p in paths:
@@ -46,6 +49,11 @@ def main():
             for a in r["attr_reads"]:
                 attr_reads[a].add(ti)
             attr_import.update(r["attr_import"])
+        if "cmp_diff" in r:
+            have_cmp = True
+            for k in r["cmp_diff"]:
+                cmp_diff[k].add(ti)
+            cmp_import.update(r["cmp_import"])
     sets = {}
     set_list = []
 
@@ -67,6 +75,9 @@ def main():
         "lambdas": {k: sid(ts) for k, ts in lambdas.items()},
         "modules": {k: sid(ts) for k, ts in modules.items()},
     }
+    if have_cmp:
+        data["cmp"] = {k: sid(ts) for k, ts in cmp_diff.items()}
+        data["cmp_import"] = sorted(cmp_import)
     if have_attrs:
         data["attr_reads"] = {k: sid(ts) for k, ts in attr_reads.items()}
         data["attr_import"] = sorted(attr_import)
@@ -81,6 +92,9 @@ def main():
         import xrefs
         data["xrefs"] = xrefs.build(sys.argv[5])
         data["str_names"] = xrefs.upper_strings(sys.argv[5])
+        import defuse
+        du = defuse.build(sys.argv[5])
+        data["du"] = {"refs": du["refs"], "aliases": du["aliases"], "strings": du["strings"]}
     raw = json.dumps(data, separators=(",", ":")).encode()
     with gzip.open(out, "wb", 9) as f:
         f.write(raw)

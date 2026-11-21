@@ -20,28 +20,40 @@ def parse(src):
         return None
 
 
-def _strip_docstrings(tree):
-    # docstrings only reach tests through doctests, which pytest does not run here
-    # (tests/test_docs.py collects nothing); sqlglot reads __doc__ only to default it
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-            body = node.body
-            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
-                    and isinstance(body[0].value.value, str):
-                node.body = body[1:] or [ast.Pass()]
-    return tree
+_BODY_OWNERS = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
 
 
-def same_ast(old_src, new_src) -> bool | None:
+def _is_doc(node):
+    return isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)
+
+
+def ast_equal(a, b, skip_docstrings=False):
+    """Structural equality ignoring positions; optionally ignoring docstrings."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, ast.AST):
+        for f in a._fields:
+            x, y = getattr(a, f, None), getattr(b, f, None)
+            if skip_docstrings and f == "body" and isinstance(a, _BODY_OWNERS):
+                x = x[1:] if x and _is_doc(x[0]) else x
+                y = y[1:] if y and _is_doc(y[0]) else y
+            if not ast_equal(x, y, skip_docstrings):
+                return False
+        return True
+    if isinstance(a, list):
+        return len(a) == len(b) and all(ast_equal(x, y, skip_docstrings) for x, y in zip(a, b))
+    return a == b
+
+
+def same_ast(old_src, new_src, old_tree=None, new_tree=None) -> bool | None:
     """True when the two sources compile to the same AST, ignoring comments,
-    formatting and docstrings."""
-    a, b = parse(old_src), parse(new_src)
+    formatting and docstrings (docstrings only reach tests through doctests,
+    which pytest does not collect here; sqlglot reads __doc__ only to default it)."""
+    a = old_tree if old_tree is not None else parse(old_src)
+    b = new_tree if new_tree is not None else parse(new_src)
     if a is None or b is None:
         return None
-    if ast.dump(a, include_attributes=False) == ast.dump(b, include_attributes=False):
-        return True
-    return ast.dump(_strip_docstrings(a), include_attributes=False) == \
-        ast.dump(_strip_docstrings(b), include_attributes=False)
+    return ast_equal(a, b, skip_docstrings=True)
 
 
 class Unit:
@@ -134,9 +146,9 @@ def code_lines(src):
 
 
 class FileIndex:
-    def __init__(self, src):
+    def __init__(self, src, tree=None):
         self.src = src
-        self.tree = parse(src)
+        self.tree = tree if tree is not None else parse(src)
         self.units = build_units(self.tree) if self.tree else []
         self.code = code_lines(src)
         self.nlines = src.count("\n") + 1
@@ -206,3 +218,40 @@ def module_name(path):
     if mod.endswith(".__init__"):
         mod = mod[: -len(".__init__")]
     return mod
+
+
+def single_compare_swap(a, b):
+    """If the only difference between two module ASTs is one comparison's operator
+    (same operands, single operator), return (lineno, col, old_op, new_op) of the
+    comparison in `a`; otherwise None."""
+    if a is None or b is None:
+        return None
+    diffs = []
+
+    def rec(x, y):
+        if len(diffs) > 1:
+            return
+        if type(x) is not type(y):
+            diffs.append(None)
+            return
+        if isinstance(x, ast.Compare):
+            if len(x.ops) == len(y.ops) == 1 and type(x.ops[0]) is not type(y.ops[0]):
+                if ast_equal(x.left, y.left) and ast_equal(x.comparators[0], y.comparators[0]):
+                    diffs.append((x.lineno, x.col_offset, type(x.ops[0]).__name__, type(y.ops[0]).__name__))
+                else:
+                    diffs.append(None)
+                return
+        if isinstance(x, ast.AST):
+            for f in x._fields:
+                rec(getattr(x, f, None), getattr(y, f, None))
+        elif isinstance(x, list):
+            if len(x) != len(y):
+                diffs.append(None)
+                return
+            for i, j in zip(x, y):
+                rec(i, j)
+        elif x != y:
+            diffs.append(None)
+
+    rec(a, b)
+    return diffs[0] if len(diffs) == 1 else None

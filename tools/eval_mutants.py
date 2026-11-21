@@ -24,6 +24,8 @@ by_kind = {}
 for tf in sorted(glob.glob(f"{mdir}/*.truth.json")):
     mid = Path(tf).name.split(".")[0]
     truth_raw = json.load(open(tf))
+    if truth_raw.get("failing") is None:
+        continue
     meta = json.load(open(f"{mdir}/{mid}.meta.json"))
     truth = set()
     for nid in truth_raw["failing"]:

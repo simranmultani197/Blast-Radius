@@ -35,6 +35,10 @@ for dp, _, fns in os.walk(os.path.join(root, "tests")):
             tests_py.append(os.path.relpath(os.path.join(dp, fn), root))
 
 sizes = {p: os.path.getsize(os.path.join(root, p)) for p in py_files}
+ALLOWED = None
+if os.environ.get("BR_LINES"):
+    ALLOWED = {f: set(v) for f, v in json.load(open(os.environ["BR_LINES"])).items()}
+    sizes = {p: len(ALLOWED[p]) for p in py_files if p in ALLOWED}
 
 SWAPS = {"==": "!=", "!=": "==", "<": "<=", "<=": "<", ">": ">=", ">=": ">", "+": "-", "-": "+",
          "and": "or", "or": "and", "True": "False", "False": "True", "is": "==", "in": "not in"}
@@ -63,6 +67,8 @@ def mutate_code(path):
     lines = src.split("\n")
     cands = []
     for t in toks:
+        if ALLOWED is not None and t.start[0] not in ALLOWED.get(path, ()):
+            continue
         if t.type == tokenize.OP and t.string in ("==", "!=", "<", "<=", ">", ">=", "+", "-"):
             cands.append(("op", t))
         elif t.type == tokenize.NAME and t.string in ("and", "or", "True", "False", "is", "not", "in", "None"):
@@ -188,7 +194,7 @@ made = 0
 attempts = 0
 while made < n and attempts < n * 50:
     attempts += 1
-    r = rng.random()
+    r = rng.random() * (0.62 if ALLOWED is not None else 1.0)
     patches, ops = [], []
     if r < 0.55:
         kind = "code"

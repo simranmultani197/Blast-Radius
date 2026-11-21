@@ -21,6 +21,7 @@ def start(test=None):
         return
     lines, opened, seen = {}, set(), set()
     attr_reads, attr_import = set(), set()
+    cmp_diff, cmp_import = set(), set()
     recv_codes, seen_types, receivers, lambdas = set(), set(), set(), set()
     modules = set()
     getframe = sys._getframe
@@ -102,12 +103,14 @@ def start(test=None):
             "modules": sorted(f[len(SRC):] for f in modules),
             "attr_reads": sorted(attr_reads),
             "attr_import": sorted(attr_import),
+            "cmp_diff": sorted(cmp_diff),
+            "cmp_import": sorted(cmp_import),
         }
         with open(f"{out_dir}/{test}.{os.getpid()}.json", "w") as f:
             json.dump(rec, f)
 
     if os.environ.get("BR_TRACE_ATTRS"):
-        _install_attr_tracer(depth, attr_reads, attr_import)
+        _install_attr_tracer(depth, attr_reads, attr_import, cmp_diff, cmp_import)
 
     _state["dump"] = dump
     _state["depth"] = depth
@@ -133,7 +136,16 @@ def start(test=None):
 UPPER = re.compile(r"^_*[A-Z][A-Z0-9_]*$")
 
 
-def _install_attr_tracer(depth, reads, import_reads):
+CMP_OPS = ["Eq", "NotEq", "Is", "IsNot", "Lt", "LtE", "Gt", "GtE"]
+CMP_ALTS = {
+    "Eq": ["NotEq", "Is", "IsNot"], "NotEq": ["Eq", "Is", "IsNot"],
+    "Is": ["IsNot", "Eq", "NotEq"], "IsNot": ["Is", "Eq", "NotEq"],
+    "Lt": ["LtE", "Gt", "GtE", "Eq", "NotEq"], "LtE": ["Lt", "Gt", "GtE", "Eq", "NotEq"],
+    "Gt": ["GtE", "Lt", "LtE", "Eq", "NotEq"], "GtE": ["Gt", "Lt", "LtE", "Eq", "NotEq"],
+}
+
+
+def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=None):
     import ast
     import builtins
     import enum
@@ -196,11 +208,57 @@ def _install_attr_tracer(depth, reads, import_reads):
         record(obj, name)
         return r
 
+    import operator
+
+    OPF = {"Eq": operator.eq, "NotEq": operator.ne, "Is": operator.is_, "IsNot": operator.is_not,
+           "Lt": operator.lt, "LtE": operator.le, "Gt": operator.gt, "GtE": operator.ge}
+    done_alts = {}
+
+    def br_cmp(site, a, b, op):
+        r = OPF[op](a, b)
+        if cmp_diff is None:
+            return r
+        if depth[0]:
+            cmp_import.add(site)
+            return r
+        seen = done_alts.get(site)
+        if seen is None:
+            seen = done_alts[site] = set()
+        alts = CMP_ALTS[op]
+        if len(seen) == len(alts):
+            return r
+        for alt in alts:
+            if alt in seen:
+                continue
+            try:
+                r2 = OPF[alt](a, b)
+                same = type(r) is bool and type(r2) is bool and r == r2
+            except Exception:  # noqa: BLE001
+                same = False
+            if not same:
+                seen.add(alt)
+                cmp_diff.add(f"{site}|{alt}")
+        return r
+
+    builtins.__br_cmp__ = br_cmp
     builtins.__br_ga__ = br_ga
     builtins.__br_getattr__ = br_getattr
     builtins.__br_hasattr__ = br_hasattr
 
     class Xform(ast.NodeTransformer):
+        def __init__(self, rel=None):
+            self.rel = rel
+
+        def visit_Compare(self, node):
+            self.generic_visit(node)
+            if self.rel and cmp_diff is not None and len(node.ops) == 1 and type(node.ops[0]).__name__ in OPF:
+                site = f"{self.rel}:{node.lineno}:{node.col_offset}"
+                new = ast.Call(func=ast.Name("__br_cmp__", ast.Load()),
+                               args=[ast.Constant(site), node.left, node.comparators[0],
+                                     ast.Constant(type(node.ops[0]).__name__)], keywords=[])
+                return ast.copy_location(new, node)
+            return node
+
         def visit_arg(self, node):
             return node  # leave annotations alone
 
@@ -245,7 +303,7 @@ def _install_attr_tracer(depth, reads, import_reads):
             st = os.stat(self.path)
             cpath = None
             if cache_dir:
-                h = hashlib.sha1(f"{self.path}|{st.st_mtime_ns}|{st.st_size}|v1".encode()).hexdigest()
+                h = hashlib.sha1(f"{self.path}|{st.st_mtime_ns}|{st.st_size}|v2".encode()).hexdigest()
                 cpath = os.path.join(cache_dir, h)
                 try:
                     with open(cpath, "rb") as f:
@@ -254,7 +312,7 @@ def _install_attr_tracer(depth, reads, import_reads):
                     pass
             src = self.get_data(self.path)
             tree = ast.parse(src, self.path)
-            tree = Xform().visit(tree)
+            tree = Xform(self.path[len(SRC):] if self.path.startswith(SRC) else None).visit(tree)
             ast.fix_missing_locations(tree)
             code = compile(tree, self.path, "exec", dont_inherit=True)
             if cpath:
