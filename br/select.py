@@ -40,6 +40,7 @@ class CovMap:
         self.dkeys = d.get("dkeys")
         self.dall = d.get("dall", {})
         self.dimport = set(d.get("dimport", []))
+        self.keyed_import = any("|getk|" in x for x in self.dimport)
         self.ev = d.get("ev")
         self.ev_unknown = frozenset(d.get("ev_unknown", []))
         self.cmp_unknown = frozenset(d.get("cmp_unknown", []))
@@ -220,6 +221,8 @@ def analyze_py(path, old_src, new_src, fp: P.FilePatch, cmap: CovMap, ch: Change
             continue
         if u.scope in ("class", "module") and cmap.dkeys is not None and line in cols:
             tests = dict_rule(cmap, path, u, line, cols[line], new_tree)
+            if tests is None and SET_RULE:
+                tests = set_rule(cmap, path, u, line, cols[line], new_tree)
             if tests is not None and cmap.dict_unknown:
                 fb = Change()
                 _scope_rule(path, fi, u, cmap, fb, "fallback")
@@ -389,7 +392,11 @@ def expression_rules(cmap, path, old_tree, new_tree, ch):
     # 2. and <-> or on two operands, where only truthiness matters
     if isinstance(x, ast.BoolOp) and isinstance(y, ast.BoolOp) and type(x.op) is not type(y.op) \
             and len(x.values) == 2 and anc and A.in_bool_context(x, anc[-1]) \
-            and all(A.ast_equal(p, q) for p, q in zip(x.values, y.values)):
+            and all(A.ast_equal(p, q) for p, q in zip(x.values, y.values)) \
+            and not any(isinstance(n, (ast.Call, ast.NamedExpr, ast.Await, ast.Yield, ast.YieldFrom, ast.Lambda))
+                        for v in x.values for n in ast.walk(v)):
+        # swapping the operator also changes whether the second operand runs at all,
+        # so only operands without calls (no side effects) qualify
         flip = "F" if isinstance(x.op, ast.And) else "T"
         a = ev(x.values[0], (flip, "?"))
         b = ev(x.values[1], (flip, "?"))
@@ -477,21 +484,26 @@ def dict_rule(cmap, path, u, line, cols, new_tree):
         return None
     i, where = hit
     imports = {m for m in ("get", "keys", "vals") if f"{origin}|{m}" in cmap.dimport}
+    keyed = cmap.keyed_import
     old_reprs = _key_reprs(d.keys[i])
     if old_reprs is None:
         return None
     reprs = set(old_reprs)
     if where == "value":
-        if imports & {"get", "vals"}:
+        if "vals" in imports:
+            return None
+        if "get" in imports and (not keyed or any(f"{origin}|getk|{r}" in cmap.dimport for r in reprs)):
             return None
         alls = ("vals",)
     else:
-        if imports:
-            return None
         new_reprs = _new_key_reprs(new_tree, st, i)
         if new_reprs is None:
             return None
         reprs |= new_reprs
+        if imports & {"keys", "vals"}:
+            return None
+        if "get" in imports and (not keyed or any(f"{origin}|getk|{r}" in cmap.dimport for r in reprs)):
+            return None
         alls = ("vals", "keys")
     out = set()
     for r in reprs:
@@ -502,6 +514,61 @@ def dict_rule(cmap, path, u, line, cols, new_tree):
         sid = cmap.dall.get(f"{origin}|{m}")
         if sid is not None:
             out |= cmap.set(sid)
+    return out
+
+
+# Off: a plain set on the left of `-`/`|` (or set.update(...)) copies a traced
+# set in C without calling its methods, so lookups can go unrecorded.
+SET_RULE = False
+
+
+def set_rule(cmap, path, u, line, cols, new_tree):
+    """A change to one member of a set display inside a traced class/module-level assignment."""
+    st = u.node
+    if not isinstance(st, (ast.Assign, ast.AnnAssign)) or st.value is None or not cmap.keyed_import:
+        return None
+    tg = st.targets if isinstance(st, ast.Assign) else [st.target]
+    if len(tg) != 1 or not isinstance(tg[0], ast.Name):
+        return None
+    mod = A.module_name(path)
+    origin = f"{mod}:{u.qual}:{tg[0].id}" if u.scope == "class" else f"{mod}::{tg[0].id}"
+    if f"{origin}|created" not in cmap.dimport or f"{origin}|keys" in cmap.dimport:
+        return None
+    c0, c1 = cols
+    hit = None
+    for n in ast.walk(st.value):
+        if isinstance(n, ast.Lambda):
+            return None
+        if isinstance(n, ast.Set):
+            for j, e in enumerate(n.elts):
+                if _span_contains(e, line, c0, c1):
+                    hit = (n, j, e)
+    if hit is None:
+        return None
+    n, j, e = hit
+    if isinstance(e, ast.Starred):
+        return None
+    old = _key_reprs(e)
+    if old is None:
+        return None
+    new = None
+    if new_tree is not None:
+        for m in ast.walk(new_tree):
+            if isinstance(m, ast.Set) and m.lineno == n.lineno and m.col_offset == n.col_offset and len(m.elts) == len(n.elts):
+                new = _key_reprs(m.elts[j]) if not isinstance(m.elts[j], ast.Starred) else None
+    if new is None:
+        return None
+    reprs = old | new
+    if any(f"{origin}|getk|{r}" in cmap.dimport for r in reprs):
+        return None
+    out = set()
+    for r in reprs:
+        sid = cmap.dkeys.get(f"{origin}|{r}")
+        if sid is not None:
+            out |= cmap.set(sid)
+    sid = cmap.dall.get(f"{origin}|keys")
+    if sid is not None:
+        out |= cmap.set(sid)
     return out
 
 

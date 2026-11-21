@@ -11,7 +11,7 @@ by = {t["number"]: t for t in tests}
 num = {t["id"]: t["number"] for t in tests}
 ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
 to = [num[t] for t in cm.tests]
-vc = json.load(open("maps/vcost.json"))
+vc = json.load(open(".work/vcost_model.json"))
 SCALE = 1.35
 HEAVY = {"tests/test_optimizer.py", "tests/test_executor.py"}
 
@@ -30,11 +30,12 @@ def add(name, patch, truth, src):
     rows.append((name, src, C, truth & C, truth - C, data_only, ch))
 for cid, v in json.load(open("sample/answers.json"))["commits"].items():
     add("S" + cid, open(f"sample/commits/{cid}.patch").read(), set(v["failing"]), "sample")
-for d, src in ((".work/mutants", "rand"), (".work/tmut", "targ")):
+for d, src in ((".work/mutants", "rand"), (".work/tmut", "targ"), (".work/smut", "spec"), (".work/kmut", "spec"), (".work/bmut", "spec"), (".work/dmut", "spec")):
     for tf in glob.glob(f"{d}/*.truth.json"):
         tr = json.load(open(tf))
         if tr.get("failing") is None: continue
         mid = Path(tf).name.split(".")[0]
+        if mid in ("m010032", "m010034"): continue
         truth = {num[n] for n in tr["failing"] if n in num and not n.startswith("tests/test_sqlglotc")}
         for ce in tr.get("collect_errors", []):
             truth |= {n for i, n in num.items() if i.startswith(ce)}
@@ -62,9 +63,8 @@ def policy(row, exp_s=2.0, drop=False, light_only=False, min_cover=0, p_pass=0.4
     miss = bool((F - out)) or bool(missed)
     return P(out) + est + (300 if miss else 0), int(bool(F - out)), True
 
-for label, kw in [("static", None), ("verify keep E", dict()), ("verify drop E", dict(drop=True)),
-                  ("light-only drop E", dict(drop=True, light_only=True)),
-                  ("light-only drop E, >=5", dict(drop=True, light_only=True, min_cover=5))]:
+for label, kw in [("static", None), ("verify drop E>=2", dict(drop=True)), ("verify drop E>=3", dict(drop=True, exp_s=3.0)),
+                  ("verify drop E>=6", dict(drop=True, exp_s=6.0)), ("verify drop E>=2 p=.6", dict(drop=True, p_pass=0.6))]:
     tot = {}; miss = {}; nv = {}
     for r in rows:
         src = r[1]
@@ -74,5 +74,5 @@ for label, kw in [("static", None), ("verify keep E", dict()), ("verify drop E",
             c, m, v = policy(r, **kw)
         tot[src] = tot.get(src, 0) + c; miss[src] = miss.get(src, 0) + m; nv[src] = nv.get(src, 0) + v
     print(f"{label:26}", "  ".join(f"{s}: n={sum(1 for r in rows if r[1]==s)} cost={tot[s]:7.1f} newmiss={miss[s]} verified={nv[s]}" for s in sorted(tot)))
-bad = [r[0] for r in rows if policy(r, drop=True)[1]]
+bad = [r[0] for r in rows if policy(r, drop=True)[1] or policy(r, drop=True, exp_s=6.0)[1]]
 print("drop-E misses:", bad)

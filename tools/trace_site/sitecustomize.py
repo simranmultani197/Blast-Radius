@@ -293,6 +293,8 @@ def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=N
                 origins = {prov.get(k, self._br_owner)} if dict.__contains__(self, k) else set(prov.values()) | {self._br_owner}
                 for o in origins:
                     d_import.add(f"{o}|get")
+                    for kr in krs:
+                        d_import.add(f"{o}|getk|{kr}")
                 return
             if dict.__contains__(self, k):
                 o = prov.get(k, self._br_owner)
@@ -436,6 +438,224 @@ def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=N
         return _real_dict(*a, **kw)
 
     builtins.__br_tdict__ = br_tdict
+
+    class TracingSet(set):
+        __slots__ = ("_br_owner", "_br_prov", "_br_family")
+
+        def _rec(self, k):
+            try:
+                krs = keyreprs(k)
+            except Exception:  # noqa: BLE001
+                krs = {"o:?"}
+            if set.__contains__(self, k):
+                origins = {self._br_prov.get(k, self._br_owner)}
+            else:
+                origins = set(self._br_family)
+            if depth[0]:
+                for o in origins:
+                    d_import.add(f"{o}|get")
+                    for kr in krs:
+                        d_import.add(f"{o}|getk|{kr}")
+            else:
+                for o in origins:
+                    for kr in krs:
+                        d_keys.add(f"{o}|{kr}")
+
+        def _rec_all(self):
+            target = d_import if depth[0] else d_all
+            for o in self._br_family:
+                target.add(f"{o}|keys")
+
+        def __contains__(self, k):
+            self._rec(k)
+            return set.__contains__(self, k)
+
+        def __iter__(self):
+            self._rec_all()
+            return set.__iter__(self)
+
+        def __eq__(self, o):
+            self._rec_all()
+            return set.__eq__(self, o)
+
+        def __ne__(self, o):
+            self._rec_all()
+            return set.__ne__(self, o)
+
+        __hash__ = None
+
+        def __repr__(self):
+            self._rec_all()
+            return set.__repr__(self)
+
+        def __reduce_ex__(self, proto):
+            self._rec_all()
+            return (set, (list(set.__iter__(self)),))
+
+        def issubset(self, o):
+            self._rec_all()
+            return set.issubset(self, o)
+
+        def issuperset(self, o):
+            self._rec_all()
+            return set.issuperset(self, o)
+
+        def isdisjoint(self, o):
+            self._rec_all()
+            return set.isdisjoint(self, o)
+
+        __le__ = issubset
+        __ge__ = issuperset
+
+        def __lt__(self, o):
+            self._rec_all()
+            return set.__lt__(self, o)
+
+        def __gt__(self, o):
+            self._rec_all()
+            return set.__gt__(self, o)
+
+        def copy(self):
+            return _ts_from(self._br_owner, [self])
+
+        def __or__(self, o):
+            return _ts_from(self._br_owner, [self, o])
+
+        def __ror__(self, o):
+            return _ts_from(self._br_owner, [o, self])
+
+        union = lambda self, *os: _ts_from(self._br_owner, [self, *os])  # noqa: E731
+
+        def __sub__(self, o):
+            return _ts_filter(self, o, keep=False)
+
+        def difference(self, *os):
+            r = self
+            for o in os:
+                r = _ts_filter(r, o, keep=False)
+            return r
+
+        def __and__(self, o):
+            return _ts_filter(self, o, keep=True)
+
+        __rand__ = __and__
+
+        def intersection(self, *os):
+            r = self
+            for o in os:
+                r = _ts_filter(r, o, keep=True)
+            return r
+
+        def __xor__(self, o):
+            a = _ts_filter(self, o, keep=False)
+            b = _ts_filter(_ts_from(self._br_owner, [o]), self, keep=False)
+            return _ts_from(self._br_owner, [a, b])
+
+    def _family(x):
+        return set(x._br_family) if isinstance(x, (TracingSet,)) else (
+            set(x._br_prov.values()) | {x._br_owner} if isinstance(x, TracingDict) else set())
+
+    def _raw_iter(x):
+        if isinstance(x, TracingSet):
+            return list(set.__iter__(x))
+        if isinstance(x, TracingDict):
+            return list(dict.keys(x))
+        return list(x)
+
+    def _origin(x, e, default):
+        if isinstance(x, TracingSet):
+            return x._br_prov.get(e, x._br_owner)
+        if isinstance(x, TracingDict):
+            return x._br_prov.get(e, x._br_owner)
+        return default
+
+    def _ts_new(owner):
+        r = TracingSet()
+        r._br_owner = owner
+        r._br_prov = {}
+        r._br_family = {owner}
+        return r
+
+    def _ts_from(owner, parts):
+        r = _ts_new(owner)
+        for p in parts:
+            r._br_family |= _family(p)
+            for e in _raw_iter(p):
+                if not set.__contains__(r, e):
+                    set.add(r, e)
+                r._br_prov[e] = _origin(p, e, f"{owner}+spread")
+        return r
+
+    def _ts_filter(a, b, keep):
+        r = _ts_new(a._br_owner)
+        r._br_family = set(a._br_family) | _family(b)
+        bs = set(_raw_iter(b))
+        for e in set.__iter__(a):
+            if (e in bs) == keep:
+                set.add(r, e)
+                r._br_prov[e] = a._br_prov.get(e, a._br_owner)
+        return r
+
+    def br_tset(owner, elts, spreads):
+        d_import.add(f"{owner}|created")
+        r = _ts_new(owner)
+        for e in elts:
+            set.add(r, e)
+            r._br_prov[e] = owner
+        for p in spreads:
+            r._br_family |= _family(p)
+            for e in _raw_iter(p):
+                set.add(r, e)
+                r._br_prov.setdefault(e, _origin(p, e, f"{owner}+spread"))
+        return r
+
+    _real_set, _real_frozenset = set, frozenset
+
+    def br_set(*a):
+        if len(a) == 1 and isinstance(a[0], TracingSet):
+            return _ts_from(a[0]._br_owner, [a[0]])
+        return _real_set(*a)
+
+    class TracingFrozenSet(TracingSet):
+        __slots__ = ()
+
+        def __hash__(self):
+            return hash(_real_frozenset(set.__iter__(self)))
+
+        def __eq__(self, o):
+            self._rec_all()
+            return set.__eq__(self, o)
+
+    def br_frozenset(*a):
+        # keep tracing through frozenset copies (immutable by convention, hashable)
+        if len(a) == 1 and isinstance(a[0], TracingSet):
+            src = a[0]
+            r = TracingFrozenSet()
+            r._br_owner, r._br_prov, r._br_family = src._br_owner, dict(src._br_prov), set(src._br_family)
+            set.update(r, set.__iter__(src))
+            return r
+        return _real_frozenset(*a)
+
+    def br_setdisp(elts, spreads):
+        if not any(isinstance(p, (TracingSet, TracingDict)) for p in spreads):
+            out = _real_set(elts)
+            for p in spreads:
+                out.update(p)
+            return out
+        r = _ts_new(next(p._br_owner for p in spreads if isinstance(p, (TracingSet, TracingDict))))
+        for e in elts:
+            set.add(r, e)
+        for p in spreads:
+            r._br_family |= _family(p)
+            for e in _raw_iter(p):
+                set.add(r, e)
+                r._br_prov.setdefault(e, _origin(p, e, r._br_owner))
+        return r
+
+    builtins.__br_tset__ = br_tset
+    builtins.__br_set__ = br_set
+    builtins.__br_frozenset__ = br_frozenset
+    builtins.__br_setdisp__ = br_setdisp
     ev_set, ev_imp = evs if evs else (set(), set())
     ev_seen = set()
 
@@ -459,6 +679,24 @@ def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=N
     builtins.__br_getattr__ = br_getattr
     builtins.__br_hasattr__ = br_hasattr
 
+    class SetWrap(ast.NodeTransformer):
+        """Set displays inside a class/module-level assignment belong to its target."""
+
+        def __init__(self, owner):
+            self.owner = owner
+
+        def visit_Lambda(self, node):
+            return node
+
+        def visit_Set(self, node):
+            self.generic_visit(node)
+            elts = [e for e in node.elts if not isinstance(e, ast.Starred)]
+            spreads = [e.value for e in node.elts if isinstance(e, ast.Starred)]
+            call = ast.Call(func=ast.Name("__br_tset__", ast.Load()),
+                            args=[ast.Constant(self.owner), ast.List(elts, ast.Load()), ast.List(spreads, ast.Load())],
+                            keywords=[])
+            return ast.copy_location(call, node)
+
     class Xform(ast.NodeTransformer):
         def __init__(self, rel=None):
             self.rel = rel
@@ -479,6 +717,11 @@ def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=N
                                         args=[ast.Constant(f"{owner_prefix}:{tg[0].id}"), ast.List(parts, ast.Load())],
                                         keywords=[])
                         st.value = ast.copy_location(call, d)
+                if isinstance(st, (ast.Assign, ast.AnnAssign)) and st.value is not None:
+                    tg = st.targets if isinstance(st, ast.Assign) else [st.target]
+                    if len(tg) == 1 and isinstance(tg[0], ast.Name):
+                        owner = f"{owner_prefix}:{tg[0].id}"
+                        st.value = SetWrap(owner).visit(st.value)
                 if isinstance(st, ast.ClassDef):
                     qual = st.name if owner_prefix.count(":") == 1 and owner_prefix.endswith(":") else None
                     base_mod = owner_prefix.split(":")[0]
@@ -511,6 +754,16 @@ def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=N
             if self.rel and evs is not None:
                 node.body = self._ev(node.body)
                 node.orelse = self._ev(node.orelse)
+            return node
+
+        def visit_Set(self, node):
+            self.generic_visit(node)
+            if self.rel and dicts is not None and any(isinstance(e, ast.Starred) for e in node.elts):
+                elts = [e for e in node.elts if not isinstance(e, ast.Starred)]
+                spreads = [e.value for e in node.elts if isinstance(e, ast.Starred)]
+                call = ast.Call(func=ast.Name("__br_setdisp__", ast.Load()),
+                                args=[ast.List(elts, ast.Load()), ast.List(spreads, ast.Load())], keywords=[])
+                return ast.copy_location(call, node)
             return node
 
         def visit_Compare(self, node):
@@ -554,6 +807,9 @@ def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=N
             if isinstance(f, ast.Name) and f.id == "dict" and dicts is not None:
                 node.func = ast.copy_location(ast.Name("__br_dict__", ast.Load()), f)
                 return node
+            if isinstance(f, ast.Name) and f.id in ("set", "frozenset") and dicts is not None:
+                node.func = ast.copy_location(ast.Name(f"__br_{f.id}__", ast.Load()), f)
+                return node
             if (isinstance(f, ast.Name) and f.id in ("getattr", "hasattr") and len(node.args) >= 2
                     and isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str)
                     and UPPER.match(node.args[1].value)):
@@ -570,7 +826,7 @@ def _install_attr_tracer(depth, reads, import_reads, cmp_diff=None, cmp_import=N
             st = os.stat(self.path)
             cpath = None
             if cache_dir:
-                h = hashlib.sha1(f"{self.path}|{st.st_mtime_ns}|{st.st_size}|v4".encode()).hexdigest()
+                h = hashlib.sha1(f"{self.path}|{st.st_mtime_ns}|{st.st_size}|v5".encode()).hexdigest()
                 cpath = os.path.join(cache_dir, h)
                 try:
                     with open(cpath, "rb") as f:
