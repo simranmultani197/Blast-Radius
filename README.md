@@ -48,6 +48,16 @@ Per changed file:
   class at runtime. Otherwise tests that used the class or a subclass, or any
   dialect it belongs to, plus import-time copies found by the xref index.
   Enums and unknown classes fall back to every importer.
+- **Value edit in a class's `arg_types` dict** (e.g. `"this": True` →
+  `False`): the values are read only by `Expr.__init_subclass__` (into
+  `required_args`) and by `**Other.arg_types` spreads, and `required_args` only
+  by `error_messages`. `tools/argtypes.py` checks this statically, and also
+  checks that every runtime read of `arg_types` in `sqlglot/` and `tests/`
+  uses keys only. A light trace (`BR_TRACE_ERRMSG=1`) records, per
+  `error_messages` call, the class that defined the dict and each key missing
+  from the instance's args. The rule selects the tests that validated an
+  instance with that key missing, for the class and for any class spreading
+  its dict. A key validated during an import falls back to the class rule.
 - **Module-level statement**: every importer.
 - **Fixtures and data files**: tests that opened them (or listed their
   directory, for added/removed files).

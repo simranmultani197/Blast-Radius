@@ -50,6 +50,10 @@ class CovMap:
         self.ev_import = set(d.get("ev_import", []))
         self.cmp = d.get("cmp")
         self.cmp_import = set(d.get("cmp_import", []))
+        self.errmsg = d.get("errmsg")
+        self.errmsg_import = set(d.get("errmsg_import", []))
+        self.errmsg_unknown = frozenset(d.get("errmsg_unknown", []))
+        self.argtypes = d.get("argtypes")
         self.all = frozenset(range(len(self.tests)))
 
     def runtime_origins(self):
@@ -227,6 +231,12 @@ def analyze_py(path, old_src, new_src, fp: P.FilePatch, cmap: CovMap, ch: Change
         if u.scope == "function":
             ch.add(cmap.span_tests(path, u.start, u.end), f"{path}:{line} {u.kind}")
             continue
+        if u.scope == "class" and ARGTYPES_RULE and cmap.errmsg is not None and line in cols:
+            tests = argtypes_rule(cmap, path, fi, u, line, cols[line], new_tree)
+            if tests is not None:
+                ch.add(tests, f"{path}:{line} arg_types value")
+                ch.notes.append(f"argtypes rule {path}:{line}")
+                continue
         if u.scope in ("class", "module") and cmap.dkeys is not None and line in cols:
             tests = dict_rule(cmap, path, u, line, cols[line], new_tree)
             if tests is None and SET_RULE:
@@ -522,6 +532,80 @@ def dict_rule(cmap, path, u, line, cols, new_tree):
         sid = cmap.dall.get(f"{origin}|{m}")
         if sid is not None:
             out |= cmap.set(sid)
+    return out
+
+
+ARGTYPES_RULE = True
+
+
+def argtypes_rule(cmap, path, fi, u, line, cols, new_tree):
+    """A value edit in one entry of a class-level `arg_types` dict literal.
+
+    The values are read at import only by Expr.__init_subclass__ (required_args)
+    and by `**Other.arg_types` spreads (tools/argtypes.py checks that statically);
+    required_args is read only by error_messages, so the tests that can see the
+    edit are those that validated an instance built from this dict with the key
+    missing (traced per call), plus runtime readers of the dict itself."""
+    at = cmap.argtypes
+    if at is None or at.get("unsafe") or "?" in cmap.errmsg_import:
+        return None
+    st = u.node
+    if not isinstance(st, (ast.Assign, ast.AnnAssign)) or not isinstance(st.value, ast.Dict):
+        return None
+    tg = st.targets if isinstance(st, ast.Assign) else [st.target]
+    if len(tg) != 1 or not isinstance(tg[0], ast.Name) or tg[0].id != "arg_types" or not u.qual:
+        return None
+    c0, c1 = cols
+    d = st.value
+    hit = None
+    for i, (k, v) in enumerate(zip(d.keys, d.values)):
+        if k is not None and _span_contains(k, line, c0, c1):
+            return None  # the key itself changed
+        if k is not None and _span_contains(v, line, c0, c1):
+            hit = i
+    if hit is None or not (isinstance(d.keys[hit], ast.Constant) and isinstance(d.keys[hit].value, str)):
+        return None
+    new = None
+    for n in ast.walk(new_tree):
+        if isinstance(n, type(st)) and n.lineno == st.lineno and isinstance(n.value, ast.Dict):
+            new = n.value
+    if new is None or len(new.keys) != len(d.keys) or \
+            not all((a is None) == (b is None) and (a is None or A.ast_equal(a, b)) for a, b in zip(d.keys, new.keys)):
+        return None
+    key = d.keys[hit].value
+    mod = A.module_name(path)
+    defs, todo = set(), [f"{mod}:{u.qual}"]
+    while todo:
+        c = todo.pop()
+        if c in defs:
+            continue
+        defs.add(c)
+        todo.extend(at["spreads"].get(c.split(":", 1)[1].split(".")[-1], []))
+    out = set()
+    for c in defs:
+        if f"{c}|{key}" in cmap.errmsg_import:
+            return None  # validated during an import: an error there breaks every importer
+        sid = cmap.errmsg.get(f"{c}|{key}")
+        if sid is not None:
+            out |= cmap.set(sid)
+        origin = f"{c}:arg_types"
+        if at.get("value_readers", ["?"]):
+            # some code may read values by key; otherwise key lookups (`k in
+            # arg_types`) cannot see a value change
+            sid = (cmap.dkeys or {}).get(f"{origin}|s:{key}")
+            if sid is not None:
+                out |= cmap.set(sid)
+        sid = cmap.dall.get(f"{origin}|vals")
+        if sid is not None:
+            out |= cmap.set(sid)
+    sid = cmap.errmsg.get("?")
+    if sid is not None:
+        out |= cmap.set(sid)
+    unknown = cmap.errmsg_unknown | cmap.dict_unknown
+    if unknown:
+        fb = Change()
+        _scope_rule(path, fi, u, cmap, fb, "fallback")
+        out |= set(fb.tests) & unknown
     return out
 
 

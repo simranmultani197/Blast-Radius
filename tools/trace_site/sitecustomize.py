@@ -26,6 +26,7 @@ def start(test=None):
     ev_sites, ev_import = set(), set()
     recv_codes, seen_types, receivers, lambdas = set(), set(), set(), set()
     modules = set()
+    errmsg, errmsg_import = set(), set()
     getframe = sys._getframe
     mon = sys.monitoring
     TOOL = 4
@@ -113,12 +114,18 @@ def start(test=None):
             "ev": sorted(ev_sites),
             "ev_import": sorted(ev_import),
         }
+        if os.environ.get("BR_TRACE_ERRMSG"):
+            rec["errmsg"] = sorted(errmsg)
+            rec["errmsg_import"] = sorted(errmsg_import)
         with open(f"{out_dir}/{test}.{os.getpid()}.json", "w") as f:
             json.dump(rec, f)
 
     if os.environ.get("BR_TRACE_ATTRS"):
         _install_attr_tracer(depth, attr_reads, attr_import, cmp_diff, cmp_import,
                              (dict_keys, dict_all, dict_import), (ev_sites, ev_import))
+
+    if os.environ.get("BR_TRACE_ERRMSG"):
+        _install_errmsg_hook(depth, errmsg, errmsg_import)
 
     _state["dump"] = dump
     _state["depth"] = depth
@@ -142,6 +149,55 @@ def start(test=None):
 
 
 UPPER = re.compile(r"^_*[A-Z][A-Z0-9_]*$")
+
+
+def _install_errmsg_hook(depth, rec, rec_import):
+    """Record, per error_messages() call, the class whose arg_types dict built the
+    instance's required_args and every arg_types key missing from its args
+    (None or []), i.e. the keys whose required flag decides an error."""
+    import importlib.machinery
+
+    def patch(module):
+        for cls in list(vars(module).values()):
+            if not (isinstance(cls, type) and "error_messages" in cls.__dict__):
+                continue
+            orig = cls.__dict__["error_messages"]
+
+            def error_messages(self, args=None, __orig=orig):
+                out = rec_import if depth[0] else rec
+                try:
+                    t = type(self)
+                    definer = next((k for k in t.__mro__ if "arg_types" in k.__dict__), None)
+                    if definer is None:
+                        out.add("?")
+                    else:
+                        dk = f"{definer.__module__}:{definer.__qualname__}"
+                        a = self.args
+                        for k in t.arg_types:
+                            v = a.get(k)
+                            if v is None or (isinstance(v, list) and not v):
+                                out.add(f"{dk}|{k}")
+                except Exception:
+                    out.add("?")
+                return __orig(self, args)
+
+            setattr(cls, "error_messages", error_messages)
+
+    class Loader(importlib.machinery.SourceFileLoader):
+        def exec_module(self, module):
+            super().exec_module(module)
+            patch(module)
+
+    class Finder:
+        def find_spec(self, name, path, target=None):
+            if name != "sqlglot.expressions.core":
+                return None
+            spec = importlib.machinery.PathFinder.find_spec(name, path)
+            if spec is not None and isinstance(spec.loader, importlib.machinery.SourceFileLoader):
+                spec.loader = Loader(spec.loader.name, spec.loader.path)
+            return spec
+
+    sys.meta_path.insert(0, Finder())
 
 
 CMP_OPS = ["Eq", "NotEq", "Is", "IsNot", "Lt", "LtE", "Gt", "GtE"]

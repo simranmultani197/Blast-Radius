@@ -32,6 +32,9 @@ def main():
     have_dict = False
     ev = collections.defaultdict(set)
     ev_import = set()
+    errmsg = collections.defaultdict(set)
+    errmsg_import = set()
+    has_errmsg = False
     num_to_id = {str(t["number"]): t["id"] for t in tests}
     paths = [p for d in trace_dir.split(",") for p in glob.glob(f"{d}/*.*.json")]
     has_dict, has_ev, has_cmp = set(), set(), set()
@@ -41,7 +44,7 @@ def main():
         r = json.load(open(p))
         ti = index[num_to_id[r["test"]]]
         tdir = os.path.dirname(p)
-        for feat, field in (("dict", "dict_keys"), ("ev", "ev"), ("cmp", "cmp_diff")):
+        for feat, field in (("dict", "dict_keys"), ("ev", "ev"), ("cmp", "cmp_diff"), ("errmsg", "errmsg")):
             c = per_dir[(feat, tdir)][ti]
             c[0] += 1
             c[1] += field in r
@@ -68,6 +71,11 @@ def main():
             for k in r["ev"]:
                 ev[k].add(ti)
             ev_import.update(r["ev_import"])
+        if "errmsg" in r:
+            has_errmsg = True
+            for k in r["errmsg"]:
+                errmsg[k].add(ti)
+            errmsg_import.update(r["errmsg_import"])
         if "cmp_diff" in r:
             has_cmp.add(ti)
             have_cmp = True
@@ -113,6 +121,10 @@ def main():
         data["ev"] = {k: sid(ts) for k, ts in ev.items()}
         data["ev_import"] = sorted(ev_import)
         data["ev_unknown"] = sorted(all_t - complete["ev"])
+    if has_errmsg:
+        data["errmsg"] = {k: sid(ts) for k, ts in errmsg.items()}
+        data["errmsg_import"] = sorted(errmsg_import)
+        data["errmsg_unknown"] = sorted(all_t - complete["errmsg"])
     if have_cmp:
         data["cmp_unknown"] = sorted(all_t - complete["cmp"])
     if have_dict:
@@ -141,6 +153,8 @@ def main():
         import defuse
         du = defuse.build(sys.argv[5])
         data["du"] = {"refs": du["refs"], "aliases": du["aliases"], "strings": du["strings"]}
+        import argtypes
+        data["argtypes"] = argtypes.build(sys.argv[5])
     raw = json.dumps(data, separators=(",", ":")).encode()
     with gzip.open(out, "wb", 9) as f:
         f.write(raw)
