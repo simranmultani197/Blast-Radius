@@ -769,7 +769,9 @@ def _inserted_text(fp: P.FilePatch):
 
 def analyze(patch_text: str, root: str, cmap: CovMap) -> Change:
     ch = Change()
-    for fp in P.parse(patch_text):
+    fps = list(P.parse(patch_text))
+    patched = {p for fp in fps for p in (fp.old_path, fp.new_path) if p}
+    for fp in fps:
         path = fp.path
         old_src = None
         if fp.old_path:
@@ -793,16 +795,26 @@ def analyze(patch_text: str, root: str, cmap: CovMap) -> Change:
                 continue
             analyze_py(path, old_src, new_src, fp, cmap, ch)
         else:
-            analyze_data(fp, old_src, new_src, cmap, ch)
+            analyze_data(fp, old_src, new_src, cmap, ch, root, patched)
     return ch
 
 
-def analyze_data(fp, old_src, new_src, cmap: CovMap, ch: Change):
+def analyze_data(fp, old_src, new_src, cmap: CovMap, ch: Change, root=None, patched=()):
     path = fp.path
     for p in {fp.old_path, fp.new_path} - {None}:
         sid = cmap.opened.get(p)
         if sid is not None:
-            ch.add(cmap.set(sid), f"reads {p}")
+            readers = cmap.set(sid)
+            if root is not None and fp.old_path == fp.new_path == p and not fp.binary:
+                try:
+                    narrowed = pair_fixture_rule(cmap, root, p, old_src, new_src, fp, readers, patched)
+                except Exception:  # noqa: BLE001 - anything unexpected: every reader
+                    narrowed = None
+                if narrowed is not None and len(narrowed) < len(readers):
+                    ch.add(narrowed, f"reads {p} (changed pair parts)")
+                    ch.notes.append(f"pair rule {p} {len(narrowed)}/{len(readers)}")
+                    continue
+            ch.add(readers, f"reads {p}")
         if fp.old_path is None or fp.new_path is None or fp.old_path != fp.new_path:
             # a file appearing or disappearing matters to tests that list its directory
             d = os.path.dirname(p)
@@ -846,3 +858,320 @@ def _config_breaks_pytest(base, old_src, new_src):
         except Exception:  # noqa: BLE001
             return True
     return True
+
+
+# ---------------------------------------------------------------------------
+# Pair-format SQL fixtures loaded once per class.
+#
+# tests/helpers.load_sql_fixture_pairs(file) yields (meta, input, expected) per
+# pair of ';'-separated statements. TestExecutor.setUpClass stores the pairs of
+# the TPC files on the class, so every executor test opens them, but only the
+# tests that read the stored pairs (and only the elements they keep) can see an
+# edit. We replay the loader on the old and new text, find which elements of
+# which pairs changed, and keep the readers that use those elements. Readers we
+# cannot account for (other classes, unrecognised uses) keep every element.
+
+FIXTURES = "tests/fixtures/"
+PAIR_LOADER = "load_sql_fixture_pairs"
+FIXTURE_LOADERS = {PAIR_LOADER, "load_sql_fixtures"}
+ALL_PARTS = frozenset({0, 1, 2})  # meta, input, expected
+_MODS = {}
+_USES = {}
+
+
+def _load_pairs(text):
+    """What tests/helpers.load_sql_fixture_pairs yields for this text (it reads
+    in text mode, so newlines are universal); raises where it would."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    s = "\n".join([line for line in text.splitlines() if line and not line.startswith("--")])
+    statements = s.split(";")
+    out = []
+    for i in range(0, len(statements), 2):
+        if i + 1 < len(statements):
+            sql_lines = statements[i].strip().split("\n")
+            meta, j = {}, 0
+            while sql_lines[j].startswith("#"):
+                key, val = sql_lines[j].split(":", maxsplit=1)
+                meta[key.lstrip("#").strip()] = val.strip()
+                j += 1
+            out.append((meta, "\n".join(sql_lines[j:]), statements[i + 1].strip()))
+    return len(statements), out
+
+
+def pair_fixture_rule(cmap, root, path, old_src, new_src, fp, readers, patched):
+    """Readers of a pair-format fixture that can observe this edit, or None."""
+    if not (path.startswith(FIXTURES) and path.endswith(".sql")) or old_src is None or new_src is None:
+        return None
+    if new_src.count("\ufffd") != old_src.count("\ufffd"):
+        return None  # bytes that are not UTF-8: the loader raises
+    # the loader and every consumer live in tests/: if any test code changes, give up
+    if any(p.endswith(".py") and (p.startswith("tests/") or os.path.basename(p) == "conftest.py") for p in patched):
+        return None
+    for h in fp.hunks:
+        for tag, txt in h.lines:
+            if tag != " " and txt.lstrip().startswith("#"):
+                return None  # meta lines: the loader can raise, setUpClass with it
+    try:
+        n_old, old = _load_pairs(old_src)
+        n_new, new = _load_pairs(new_src)
+    except Exception:  # noqa: BLE001
+        return None
+    if n_old != n_new or len(old) != len(new):
+        return None
+    changed = set()
+    for (m0, s0, e0), (m1, s1, e1) in zip(old, new):
+        if m0 != m1:
+            return None
+        if s0 != s1:
+            changed.add(1)
+        if e0 != e1:
+            changed.add(2)
+    rel = path[len(FIXTURES):]
+    by_class = {}
+    for t in readers:
+        parts = cmap.tests[t].split("::")
+        if len(parts) >= 3:
+            by_class.setdefault((parts[0], parts[1]), set()).add(t)
+    out = set(readers)
+    for (mod, cname), ts in by_class.items():
+        key = (mod, cname, rel)
+        if key not in _USES:
+            _USES[key] = _class_pair_uses(cmap, root, mod, cname, rel)
+        uses = _USES[key]
+        if uses is None:
+            continue  # not accounted for: every element
+        for t in ts:
+            if not (uses.get(t, frozenset()) & changed):
+                out.discard(t)
+    return out
+
+
+def _module_tree(root, mod, needle):
+    """The parsed test module, only when its text names the fixture (the
+    setUpClass loads we recognise use a literal path)."""
+    if mod not in _MODS:
+        try:
+            with open(os.path.join(root, mod), encoding="utf-8") as f:
+                _MODS[mod] = [f.read(), None]
+        except (OSError, UnicodeDecodeError):
+            _MODS[mod] = [None, None]
+    src, tree = _MODS[mod]
+    if src is None or needle not in src:
+        return None
+    if tree is None:
+        try:
+            tree = _MODS[mod][1] = ast.parse(src)
+        except (SyntaxError, ValueError):
+            _MODS[mod][0] = None
+            return None
+    return tree
+
+
+def _parents(tree):
+    par = {}
+    for n in ast.walk(tree):
+        for c in ast.iter_child_nodes(n):
+            par[c] = n
+    return par
+
+
+def _is_opener(call, openers):
+    f = call.func
+    if isinstance(f, ast.Name):
+        return f.id in openers
+    return isinstance(f, ast.Attribute) and f.attr in ("open", "read_text", "read_bytes", "listdir", "scandir",
+                                                       "glob", "iglob", "walk", "read_csv", "read_json",
+                                                       "read_table", "read_parquet", "loadtxt")
+
+
+def _class_pair_uses(cmap, root, mod, cname, rel):
+    """For tests of mod::cname, which pair elements of fixture `rel` each one reads,
+    when the class loads it in setUpClass and nothing else in the module can."""
+    tree = _module_tree(root, mod, rel)
+    if tree is None:
+        return None
+    imported = {a.asname or a.name for n in tree.body if isinstance(n, ast.ImportFrom) and n.module == "tests.helpers"
+                for a in n.names if a.name in FIXTURE_LOADERS}
+    if PAIR_LOADER not in imported:
+        return None
+    cls = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == cname]
+    if len(cls) != 1:
+        return None
+    cls = cls[0]
+    setup = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "setUpClass"]
+    if len(setup) != 1 or not setup[0].args.args:
+        return None
+    setup = setup[0]
+    cls_arg = setup.args.args[0].arg
+    par = _parents(tree)
+
+    def in_setup(n):
+        while n is not None:
+            if n is setup:
+                return True
+            n = par.get(n)
+        return False
+
+    # every fixture load in the module: `cls.ATTR = [list(]loader("literal")[)]` in setUpClass
+    attrs, stores = set(), set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in imported:
+            if not (in_setup(n) and len(n.args) == 1 and not n.keywords and isinstance(n.args[0], ast.Constant)
+                    and isinstance(n.args[0].value, str) and n.func.id == PAIR_LOADER):
+                return None
+            outer = par.get(n)
+            if isinstance(outer, ast.Call) and isinstance(outer.func, ast.Name) and outer.func.id == "list" \
+                    and outer.args == [n] and not outer.keywords:
+                n2, outer = outer, par.get(outer)
+            else:
+                n2 = n
+            if not (isinstance(outer, ast.Assign) and outer.value is n2 and len(outer.targets) == 1
+                    and isinstance(outer.targets[0], ast.Attribute) and isinstance(outer.targets[0].value, ast.Name)
+                    and outer.targets[0].value.id == cls_arg):
+                return None
+            stores.add(outer.targets[0])
+            if os.path.normpath(n.args[0].value) == os.path.normpath(rel):
+                attrs.add(outer.targets[0].attr)
+    if not attrs:
+        return None
+    # nothing outside setUpClass may open files: module-level helpers that do are
+    # allowed only when setUpClass is their sole caller
+    openers = {"open"}
+    funcs = {n.name: n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    grew = True
+    while grew:
+        grew = False
+        for name, fn in funcs.items():
+            if name not in openers and any(isinstance(c, ast.Call) and _is_opener(c, openers) for c in ast.walk(fn)):
+                openers.add(name)
+                grew = True
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and n.id in openers - {"open"} and not in_setup(n):
+            return None
+        if isinstance(n, ast.Call) and _is_opener(n, openers) and not in_setup(n):
+            top = n
+            while par.get(top) is not None and par.get(top) is not tree:
+                top = par[top]
+            if not (isinstance(top, (ast.FunctionDef, ast.AsyncFunctionDef)) and top.name in openers):
+                return None
+        if isinstance(n, ast.Constant) and n.value in attrs:
+            return None  # getattr(self, "ATTR") and friends
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("getattr", "setattr", "delattr", "vars") \
+                and not (len(n.args) >= 2 and isinstance(n.args[1], ast.Constant)):
+            return None
+        if isinstance(n, ast.Attribute) and n.attr == "__dict__":
+            return None
+    methods = {n.name: n for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    uses = {}
+    for n in ast.walk(tree):
+        if not (isinstance(n, ast.Attribute) and n.attr in attrs) or n in stores:
+            continue
+        if not isinstance(n.ctx, ast.Load) or in_setup(n):
+            return None
+        fn = _enclosing_func(n, par)
+        if fn is None:
+            return None
+        pos = _elem_use(n, par, fn, methods, 0)
+        tests = _ref_tests(cmap, mod, n, par)
+        for t in tests:
+            uses[t] = uses.get(t, frozenset()) | (ALL_PARTS if pos is None else frozenset(pos))
+    return uses
+
+
+def _enclosing_func(n, par):
+    while n is not None:
+        n = par.get(n)
+        if isinstance(n, ast.Lambda):
+            return None
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return n
+    return None
+
+
+def _target_positions(target, fn):
+    """Which of the 3 unpacked pair elements the function goes on to read."""
+    if not (isinstance(target, (ast.Tuple, ast.List)) and len(target.elts) == 3
+            and all(isinstance(e, ast.Name) for e in target.elts)):
+        return None
+    if any(isinstance(c, ast.Call) and isinstance(c.func, ast.Name) and c.func.id in ("locals", "vars", "eval", "exec")
+           for c in ast.walk(fn)):
+        return None
+    loaded = {x.id for x in ast.walk(fn) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load)}
+    return {i for i, e in enumerate(target.elts) if e.id in loaded}
+
+
+def _elem_use(node, par, fn, methods, depth):
+    """Pair elements read through one use of the list of pairs; None = unknown (all)."""
+    p = par.get(node)
+    if isinstance(p, (ast.For, ast.comprehension)) and p.iter is node:
+        return _target_positions(p.target, fn)
+    if isinstance(p, ast.Call) and isinstance(p.func, ast.Name) and p.func.id == "enumerate" \
+            and p.args and p.args[0] is node and len(p.args) <= 2:
+        g = par.get(p)
+        if isinstance(g, (ast.For, ast.comprehension)) and g.iter is p and isinstance(g.target, ast.Tuple) \
+                and len(g.target.elts) == 2:
+            return _target_positions(g.target.elts[1], fn)
+        return None
+    if isinstance(p, ast.Subscript) and p.value is node and isinstance(p.ctx, ast.Load) \
+            and not isinstance(p.slice, ast.Slice):
+        s, q = p, par.get(p)
+        if isinstance(q, ast.IfExp) and (q.body is s or q.orelse is s):
+            s, q = q, par.get(q)
+        if isinstance(q, ast.Assign) and q.value is s and len(q.targets) == 1:
+            return _target_positions(q.targets[0], fn)
+        return None
+    if isinstance(p, ast.Call) and node in p.args and isinstance(p.func, ast.Attribute) \
+            and isinstance(p.func.value, ast.Name) and p.func.value.id in ("self", "cls") and depth < 3:
+        meth = methods.get(p.func.attr)
+        idx = p.args.index(node)
+        if meth is None or any(isinstance(a, ast.Starred) for a in p.args[: idx + 1]):
+            return None
+        decos = {d.id for d in meth.decorator_list if isinstance(d, ast.Name)}
+        if meth.decorator_list and not decos <= {"staticmethod", "classmethod"} or \
+                len(decos) != len(meth.decorator_list):
+            return None
+        params = meth.args.posonlyargs + meth.args.args
+        k = idx + (0 if "staticmethod" in decos else 1)
+        if k >= len(params):
+            return None
+        pname = params[k].arg
+        mpar = _parents(meth)
+        out = set()
+        for x in ast.walk(meth):
+            if isinstance(x, ast.Name) and x.id == pname:
+                if not isinstance(x.ctx, ast.Load):
+                    return None
+                r = _elem_use(x, mpar, meth, methods, depth + 1)
+                if r is None:
+                    return None
+                out |= r
+        return out
+    return None
+
+
+def _ref_tests(cmap, mod, n, par):
+    """Tests that evaluated this reference: the lines of its statement (the header
+    only, for compound statements), narrowed by ternary-branch profiles."""
+    st = n
+    while st is not None and not isinstance(st, ast.stmt):
+        st = par.get(st)
+    if st is None:
+        return set(cmap.file_tests(mod))
+    if isinstance(st, (ast.For, ast.AsyncFor, ast.While, ast.If, ast.With, ast.AsyncWith, ast.Try)):
+        end = n.end_lineno
+    else:
+        end = st.end_lineno
+    tests = set(cmap.span_tests(mod, st.lineno, end))
+    s, q = par.get(n), None
+    if isinstance(s, ast.Subscript):
+        q = par.get(s)
+    if isinstance(q, ast.IfExp) and (q.body is s or q.orelse is s) and cmap.ev is not None:
+        site = f"{mod}:{s.lineno}:{s.col_offset}"
+        if not any(f"{site}|{t}" in cmap.ev_import for t in ("T", "F", "?")):
+            ev = set()
+            for t in ("T", "F", "?"):
+                sid = cmap.ev.get(f"{site}|{t}")
+                if sid is not None:
+                    ev |= cmap.set(sid)
+            tests &= ev | set(cmap.ev_unknown)
+    return tests

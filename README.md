@@ -51,6 +51,16 @@ Per changed file:
 - **Module-level statement**: every importer.
 - **Fixtures and data files**: tests that opened them (or listed their
   directory, for added/removed files).
+- **Pair-format SQL fixtures loaded in `setUpClass`** (the TPC-H/TPC-DS files
+  in `TestExecutor`): the selector replays `load_sql_fixture_pairs` on the old
+  and new text to find which elements (meta, input, expected) of which pairs
+  changed. It then reads the pinned test module to see which element each
+  test keeps from the class attribute holding the pairs (`for _, sql, _ in
+  ...`, unpacking assignments, pass-through to a method), with line coverage
+  and ternary-branch profiles saying which tests ran each use. Executor tests
+  that never read the pairs drop out. Readers in other classes keep every
+  element. A changed `#` meta line, a changed statement count, a loader error
+  or any changed test code fall back to every reader.
 - **pyproject.toml / setup.cfg**: every test if pytest's settings change or
   the file stops parsing.
 
@@ -69,5 +79,9 @@ constant swaps, negation, statement deletion, comment insertion, fixture edits,
 multi-file combinations) and `tools/label.py` labels them by running the full
 suite; `tools/eval_mutants.py` checks the selector never misses. These are for
 testing only and are not shipped.
+
+`tools/gen_fixture.py` makes targeted edits to the TPC fixtures (input and
+expected statements, comment, blank and meta lines, `;` changes, and
+sample-style token edits), labelled by running every reader of the file.
 
 `make sample` scores the 30 sample commits (see `KIT_README.md`, `SCORING.md`).
