@@ -1,0 +1,7 @@
+.work
+.git
+sample
+output.jsonl
+tools
+*.md
+score.py

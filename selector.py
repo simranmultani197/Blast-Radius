@@ -1,0 +1,64 @@
+"""Blast Radius selector: which sqlglot tests can a patch break, and on which workers.
+
+For each patch we find the statements it changes in the pinned tree and select
+the tests that execute them, using maps built from the pinned commit:
+per-test line coverage (each test traced in a fresh process, so module- and
+class-level lines count for every test that imports them), the classes each
+test calls methods on, the lambdas it calls and the data files it opens.
+"""
+import json
+import os
+import sys
+import time
+import traceback
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+from br.pack import pack  # noqa: E402
+from br.select import CovMap, analyze  # noqa: E402
+
+DATA = Path(os.environ.get("BR_DATA", "/data"))
+ROOT = os.environ.get("BR_SQLGLOT", "/opt/sqlglot")
+MAP = os.environ.get("BR_MAP", str(HERE / "maps" / "map.json.gz"))
+
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+def main():
+    t0 = time.time()
+    tests = json.loads((DATA / "tests.json").read_text())["tests"]
+    ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+    num_by_id = {t["id"]: t["number"] for t in tests}
+    all_nums = sorted(ms)
+    cmap = CovMap(MAP)
+    to_num = [num_by_id.get(tid) for tid in cmap.tests]
+    unmapped = [n for tid, n in num_by_id.items() if tid not in set(cmap.tests)]
+    if unmapped:
+        log(f"warning: {len(unmapped)} tests are not in the map")
+    lines = []
+    for patch in sorted((DATA / "commits").glob("*.patch")):
+        cid = patch.stem
+        try:
+            ch = analyze(patch.read_text(encoding="utf-8", errors="replace"), ROOT, cmap)
+            sel = {to_num[i] for i in ch.tests if to_num[i] is not None}
+            if ch.broad and unmapped:
+                sel |= set(unmapped)
+            why = f"{len(sel)} tests" + (" (broad)" if ch.broad else "")
+        except Exception:  # noqa: BLE001 - never crash: fall back to running everything
+            log(f"{cid}: analysis failed, running everything\n{traceback.format_exc()}")
+            sel = set(all_nums)
+            why = "fallback"
+        workers, cost = pack(sorted(sel), ms)
+        lines.append(json.dumps({"commit": cid, "workers": workers}, separators=(",", ":")))
+        log(f"{cid}: {why}, {len(workers)} workers, est {cost / 1000:.1f}s")
+    sys.stdout.write("\n".join(lines) + ("\n" if lines else ""))
+    sys.stdout.flush()
+    log(f"done {len(lines)} commits in {time.time() - t0:.1f}s")
+
+
+if __name__ == "__main__":
+    main()
