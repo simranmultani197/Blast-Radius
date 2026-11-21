@@ -57,7 +57,8 @@ def main():
         log(f"{cid}: {why}, {len(workers)} workers, est {cost / 1000:.1f}s")
     sys.stdout.write("\n".join(lines) + ("\n" if lines else ""))
     sys.stdout.flush()
-    log(f"done {len(lines)} commits in {time.time() - t0:.1f}s")
+    cpu = time.process_time()
+    log(f"done {len(lines)} commits in {time.time() - t0:.1f}s wall, {cpu:.2f}s cpu")
 
 
 if __name__ == "__main__":
