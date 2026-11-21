@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import gzip
+import re
 import json
 import os
 
@@ -23,6 +24,10 @@ class CovMap:
         self.lambdas = d.get("lambdas", {})
         self.classes = d.get("classes", {})
         self.xrefs = d.get("xrefs", {})
+        self.modules = d.get("modules", {})
+        self.attr_reads = d.get("attr_reads")
+        self.attr_import = set(d.get("attr_import", []))
+        self.str_names = set(d.get("str_names", []))
         self.all = frozenset(range(len(self.tests)))
 
     def recv_tests(self, key):
@@ -65,11 +70,23 @@ class CovMap:
         return out
 
     def file_tests(self, path):
+        """Tests that import the module at path (or run any of its lines)."""
         d = self.files.get(path)
         out = set()
         if d:
             for sid in set(d.values()):
                 out |= self.set(sid)
+        sid = self.modules.get(path)
+        if sid is not None:
+            out |= self.set(sid)
+        if not out and path.endswith(".py"):
+            # never imported by a traced test: a package __init__ is still
+            # imported by everything below it
+            pkg = os.path.dirname(path)
+            if os.path.basename(path) == "__init__.py":
+                for f, sid2 in self.modules.items():
+                    if f.startswith(pkg + "/"):
+                        out |= self.set(sid2)
         return out
 
 
@@ -191,11 +208,62 @@ def _near(path, fi, before, after, cmap, ch):
 REGISTRY_ATTRS = {"_sql_names", "key", "__name__", "__qualname__", "__slots__", "__init_subclass__"}
 
 
+UPPER = re.compile(r"^_*[A-Z][A-Z0-9_]*$")
+
+
+def attr_rule(cmap, ckey, names, cls_node, stmt):
+    """Tests that read class attribute ckey.NAME at runtime, when that is all that can matter."""
+    if cmap.attr_reads is None or not names or cls_node is None:
+        return None
+    if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+        return None
+    targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+    if not all(isinstance(t, ast.Name) for t in targets):
+        return None
+    out = set()
+    for n in names:
+        if not UPPER.match(n) or n in cmap.str_names or f"{ckey}:{n}" in cmap.attr_import:
+            return None
+        if _class_body_reads(cls_node, n, stmt):
+            return None
+        sid = cmap.attr_reads.get(f"{ckey}:{n}")
+        if sid is not None:
+            out |= cmap.set(sid)
+    return out
+
+
+def _class_body_reads(cls_node, name, skip):
+    """Does code running in the class body itself (not in methods) read `name`?"""
+    def walk(nodes):
+        for st in nodes:
+            if st is skip:
+                continue
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                exprs = st.decorator_list + st.args.defaults + [d for d in st.args.kw_defaults if d is not None]
+            elif isinstance(st, ast.ClassDef):
+                exprs = st.bases + [k.value for k in st.keywords] + st.decorator_list
+            else:
+                exprs = [st]
+            for e in exprs:
+                for n in ast.walk(e):
+                    if isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Load):
+                        return True
+        return False
+
+    return walk(cls_node.body)
+
+
 def _scope_rule(path, fi, u, cmap, ch, why, attrs=None):
     """A statement that runs at import time (class body or module level)."""
     if u.scope == "class" and u.qual and cmap.classes:
         ckey = f"{A.module_name(path)}:{u.qual}"
         names = A.assigned_names(u.node) if attrs is None else attrs
+        if attrs is None:
+            tests = attr_rule(cmap, ckey, names, u.cls, u.node)
+            if tests is not None:
+                ch.add(tests, why + f" attr {u.qual}.{sorted(names)}")
+                ch.notes.append(f"attr rule {ckey} {sorted(names)}")
+                return
         tests = class_tests(cmap, ckey, names, u.cls, path)
         if tests is not None:
             ch.add(tests, why + f" class {u.qual}")
@@ -333,9 +401,46 @@ def analyze_data(fp, old_src, new_src, cmap: CovMap, ch: Change):
         sid = cmap.opened.get(p)
         if sid is not None:
             ch.add(cmap.set(sid), f"reads {p}")
+        if fp.old_path is None or fp.new_path is None or fp.old_path != fp.new_path:
+            # a file appearing or disappearing matters to tests that list its directory
+            d = os.path.dirname(p)
+            while True:
+                sid = cmap.opened.get(d + "/")
+                if sid is not None:
+                    ch.add(cmap.set(sid), f"lists {d}/")
+                if not d:
+                    break
+                d = os.path.dirname(d)
     base = os.path.basename(path)
-    if base in ("pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini"):
-        text = "\n".join(t for h in fp.hunks for _, t in h.lines)
-        if "pytest" in text or "[tool.pytest" in text or "addopts" in text:
+    if base in ("pyproject.toml", "setup.cfg", "pytest.ini", "tox.ini", "conftest.py") and os.path.dirname(path) == "":
+        if _config_breaks_pytest(base, old_src, new_src):
             ch.add(cmap.all, "pytest config")
             ch.broad = True
+
+
+def _config_breaks_pytest(base, old_src, new_src):
+    """pytest reads these at startup; a broken file or new pytest settings affect every test."""
+    if new_src is None:
+        return base in ("pytest.ini", "tox.ini")
+    if base == "pyproject.toml":
+        try:
+            import tomllib
+
+            old = tomllib.loads(old_src or "")
+            new = tomllib.loads(new_src)
+        except Exception:  # noqa: BLE001
+            return True
+        return old.get("tool", {}).get("pytest") != new.get("tool", {}).get("pytest")
+    if base in ("setup.cfg", "tox.ini", "pytest.ini"):
+        import configparser
+
+        def sections(text):
+            cp = configparser.RawConfigParser(strict=False)
+            cp.read_string(text or "")
+            return {k: dict(cp[k]) for k in cp.sections() if "pytest" in k}
+
+        try:
+            return sections(old_src) != sections(new_src)
+        except Exception:  # noqa: BLE001
+            return True
+    return True

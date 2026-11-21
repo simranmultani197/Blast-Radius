@@ -30,7 +30,8 @@ def run_one(num, nodeid, out_dir):
 
     tracer.start(num)
     t0 = time.perf_counter()
-    rc = pytest.main([nodeid, "-q", "-p", "no:cacheprovider", "--no-header", "-s"], plugins=[Rec()])
+    extra = ["--assert=plain"] if os.environ.get("BR_TRACE_ATTRS") else []
+    rc = pytest.main([nodeid, "-q", "-p", "no:cacheprovider", "--no-header", "-s"] + extra, plugins=[Rec()])
     dt = time.perf_counter() - t0
     tracer.finish()
     with open(f"{out_dir}/{num}.result", "w") as f:

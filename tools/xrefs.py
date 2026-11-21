@@ -62,3 +62,24 @@ def build(root):
                     scan_file(p, os.path.relpath(p, root), out)
     # dedupe
     return {k: sorted({tuple(x) if x[2] else (x[0], x[1], "") for x in v}) for k, v in out.items()}
+
+
+def upper_strings(root):
+    """Every ALL_CAPS identifier-like string literal in sqlglot/ and tests/ (dynamic attribute names)."""
+    import re
+
+    pat = re.compile(r"^_*[A-Z][A-Z0-9_]*$")
+    out = set()
+    for d in ("sqlglot", "tests"):
+        for dp, _, fns in os.walk(os.path.join(root, d)):
+            for fn in fns:
+                if not fn.endswith(".py"):
+                    continue
+                try:
+                    tree = ast.parse(open(os.path.join(dp, fn), encoding="utf-8").read())
+                except SyntaxError:
+                    continue
+                for n in ast.walk(tree):
+                    if isinstance(n, ast.Constant) and isinstance(n.value, str) and pat.match(n.value):
+                        out.add(n.value)
+    return sorted(out)

@@ -13,7 +13,10 @@ with tarfile.open(fileobj=io.BytesIO(data)) as tf:
     tf.extractall("/opt", filter="data")
 shutil.move(f"/opt/sqlglot-{sha}", "/opt/sqlglot")
 PY
-RUN chmod -R a+rX /opt/sqlglot
+# The environment the commits were labelled in, so tests can be run to verify.
+COPY requirements.lock /app/requirements.lock
+RUN pip install --no-cache-dir -r /app/requirements.lock
+RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests && chmod -R a+rX /opt/sqlglot
 
 COPY selector.py /app/selector.py
 COPY br /app/br

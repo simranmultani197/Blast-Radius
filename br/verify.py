@@ -160,18 +160,23 @@ def _child(farm, nodeids, budgets, wfd):
     cf.wait = _inline_wait
     import pytest
 
-    class Timeout(Exception):
-        pass
+    current = [None]
 
     def on_alarm(signum, frame):
-        signal.setitimer(signal.ITIMER_REAL, 0.5)
-        raise Timeout("budget exceeded")
+        # never raise into pytest: report and stop; the parent includes every
+        # test that did not finish
+        try:
+            out.write(json.dumps(["timeout", current[0]]) + "\n")
+            out.flush()
+        finally:
+            os._exit(3)
 
     signal.signal(signal.SIGALRM, on_alarm)
 
     class Rec:
         @pytest.hookimpl(hookwrapper=True)
         def pytest_runtest_protocol(self, item, nextitem):
+            current[0] = item.nodeid
             signal.setitimer(signal.ITIMER_REAL, budgets.get(item.nodeid, 5.0))
             out.write(json.dumps(["start", item.nodeid]) + "\n")
             yield
@@ -259,6 +264,8 @@ def collect(job: Job):
             collect_fail.append(nid)
         elif kind == "done":
             done = True
+        elif kind == "timeout" and nid:
+            failing.add(nid)
     unknown = set()
     for nid in job.nodeids:
         if nid in failing:

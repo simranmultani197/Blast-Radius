@@ -6,6 +6,7 @@ Active only when BR_TRACE_DIR and BR_TRACE_TEST are set; each process writes
 import atexit
 import json
 import os
+import re
 import signal
 import sys
 
@@ -19,7 +20,9 @@ def start(test=None):
     if not out_dir or test is None or _state:
         return
     lines, opened, seen = {}, set(), set()
+    attr_reads, attr_import = set(), set()
     recv_codes, seen_types, receivers, lambdas = set(), set(), set(), set()
+    modules = set()
     getframe = sys._getframe
     mon = sys.monitoring
     TOOL = 4
@@ -49,6 +52,7 @@ def start(test=None):
             mon.set_local_events(TOOL, code, mon.events.LINE)
             if code.co_name == "<module>":
                 module_codes.add(code)
+                modules.add(code.co_filename)
                 mon.set_local_events(TOOL, code, mon.events.LINE)
                 depth[0] += 1
                 return None
@@ -95,9 +99,15 @@ def start(test=None):
             "opened": sorted(p[len(SRC):] for p in opened),
             "receivers": sorted(receivers),
             "lambdas": sorted([f[len(SRC):], ln] for f, ln in lambdas),
+            "modules": sorted(f[len(SRC):] for f in modules),
+            "attr_reads": sorted(attr_reads),
+            "attr_import": sorted(attr_import),
         }
         with open(f"{out_dir}/{test}.{os.getpid()}.json", "w") as f:
             json.dump(rec, f)
+
+    if os.environ.get("BR_TRACE_ATTRS"):
+        _install_attr_tracer(depth, attr_reads, attr_import)
 
     _state["dump"] = dump
     _state["depth"] = depth
@@ -118,6 +128,152 @@ def start(test=None):
         signal.signal(signal.SIGTERM, on_term)
     except ValueError:
         pass
+
+
+UPPER = re.compile(r"^_*[A-Z][A-Z0-9_]*$")
+
+
+def _install_attr_tracer(depth, reads, import_reads):
+    import ast
+    import builtins
+    import enum
+    import importlib.abc
+    import importlib.machinery
+
+    owner_cache = {}
+    skip_types = set()
+
+    def owner_of(cls, name):
+        k = (cls, name)
+        o = owner_cache.get(k, 0)
+        if o == 0:
+            o = None
+            for base in getattr(cls, "__mro__", ()):
+                if name in base.__dict__:
+                    m = getattr(base, "__module__", "") or ""
+                    if m.startswith(("sqlglot", "tests")):
+                        o = f"{m}:{base.__qualname__}:{name}"
+                    break
+            owner_cache[k] = o
+        return o
+
+    def record(obj, name):
+        try:
+            if isinstance(obj, type):
+                if obj in skip_types:
+                    return
+                if issubclass(obj, enum.Enum):
+                    skip_types.add(obj)
+                    return
+                o = owner_of(obj, name)
+            else:
+                d = getattr(obj, "__dict__", None)
+                if d is not None and name in d:
+                    return
+                o = owner_of(type(obj), name)
+            if o is not None:
+                (import_reads if depth[0] else reads).add(o)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def br_ga(obj, name):
+        r = getattr(obj, name)
+        record(obj, name)
+        return r
+
+    _missing = object()
+
+    def br_getattr(obj, name, default=_missing):
+        if default is _missing:
+            r = getattr(obj, name)
+        else:
+            r = getattr(obj, name, default)
+        record(obj, name)
+        return r
+
+    def br_hasattr(obj, name):
+        r = hasattr(obj, name)
+        record(obj, name)
+        return r
+
+    builtins.__br_ga__ = br_ga
+    builtins.__br_getattr__ = br_getattr
+    builtins.__br_hasattr__ = br_hasattr
+
+    class Xform(ast.NodeTransformer):
+        def visit_arg(self, node):
+            return node  # leave annotations alone
+
+        def visit_FunctionDef(self, node):
+            node.args = self.visit(node.args)
+            node.body = [self.visit(x) for x in node.body]
+            node.decorator_list = [self.visit(x) for x in node.decorator_list]
+            return node
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_AnnAssign(self, node):
+            if node.value is not None:
+                node.value = self.visit(node.value)
+            node.target = self.visit(node.target)
+            return node
+
+        def visit_Attribute(self, node):
+            self.generic_visit(node)
+            if isinstance(node.ctx, ast.Load) and UPPER.match(node.attr):
+                new = ast.Call(func=ast.Name("__br_ga__", ast.Load()), args=[node.value, ast.Constant(node.attr)],
+                               keywords=[])
+                return ast.copy_location(new, node)
+            return node
+
+        def visit_Call(self, node):
+            self.generic_visit(node)
+            f = node.func
+            if (isinstance(f, ast.Name) and f.id in ("getattr", "hasattr") and len(node.args) >= 2
+                    and isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str)
+                    and UPPER.match(node.args[1].value)):
+                node.func = ast.copy_location(ast.Name(f"__br_{f.id}__", ast.Load()), f)
+            return node
+
+    import hashlib
+    import marshal
+
+    cache_dir = os.environ.get("BR_XCACHE")
+
+    class XLoader(importlib.machinery.SourceFileLoader):
+        def get_code(self, fullname):
+            st = os.stat(self.path)
+            cpath = None
+            if cache_dir:
+                h = hashlib.sha1(f"{self.path}|{st.st_mtime_ns}|{st.st_size}|v1".encode()).hexdigest()
+                cpath = os.path.join(cache_dir, h)
+                try:
+                    with open(cpath, "rb") as f:
+                        return marshal.loads(f.read())
+                except OSError:
+                    pass
+            src = self.get_data(self.path)
+            tree = ast.parse(src, self.path)
+            tree = Xform().visit(tree)
+            ast.fix_missing_locations(tree)
+            code = compile(tree, self.path, "exec", dont_inherit=True)
+            if cpath:
+                tmp = f"{cpath}.{os.getpid()}"
+                with open(tmp, "wb") as f:
+                    f.write(marshal.dumps(code))
+                os.replace(tmp, cpath)
+            return code
+
+    class Finder(importlib.abc.MetaPathFinder):
+        def find_spec(self, name, path, target=None):
+            spec = importlib.machinery.PathFinder.find_spec(name, path)
+            if spec is not None and spec.origin and spec.origin.startswith(SRC) and spec.origin.endswith(".py") \
+                    and isinstance(spec.loader, importlib.machinery.SourceFileLoader):
+                spec.loader = XLoader(spec.loader.name, spec.loader.path)
+            return spec
+
+    sys.meta_path.insert(0, Finder())
+    sys.dont_write_bytecode = True
 
 
 def finish():

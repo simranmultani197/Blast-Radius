@@ -20,12 +20,28 @@ def parse(src):
         return None
 
 
+def _strip_docstrings(tree):
+    # docstrings only reach tests through doctests, which pytest does not run here
+    # (tests/test_docs.py collects nothing); sqlglot reads __doc__ only to default it
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                node.body = body[1:] or [ast.Pass()]
+    return tree
+
+
 def same_ast(old_src, new_src) -> bool | None:
-    """True when the two sources compile to the same AST (comments/format only)."""
+    """True when the two sources compile to the same AST, ignoring comments,
+    formatting and docstrings."""
     a, b = parse(old_src), parse(new_src)
     if a is None or b is None:
         return None
-    return ast.dump(a, include_attributes=False) == ast.dump(b, include_attributes=False)
+    if ast.dump(a, include_attributes=False) == ast.dump(b, include_attributes=False):
+        return True
+    return ast.dump(_strip_docstrings(a), include_attributes=False) == \
+        ast.dump(_strip_docstrings(b), include_attributes=False)
 
 
 class Unit:

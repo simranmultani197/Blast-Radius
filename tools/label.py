@@ -26,10 +26,14 @@ def start(pf, slot):
     w = f"/tmp/w{slot}"
     shutil.rmtree(w, ignore_errors=True)
     os.makedirs(w)
-    for name in ("sqlglot", "tests"):
-        shutil.copytree(f"{src}/{name}", f"{w}/{name}", ignore=shutil.ignore_patterns("__pycache__"))
-    for name in ("pyproject.toml", "setup.cfg"):
-        shutil.copy(f"{src}/{name}", w)
+    for name in os.listdir(src):
+        if name in (".git",):
+            continue
+        s, d = f"{src}/{name}", f"{w}/{name}"
+        if os.path.isdir(s):
+            shutil.copytree(s, d, ignore=shutil.ignore_patterns("__pycache__", ".git"), symlinks=True)
+        else:
+            shutil.copy(s, d)
     for fp in P.parse(open(pf).read()):
         old = open(f"{w}/{fp.old_path}", encoding="utf-8", newline="").read() if fp.old_path else None
         new = P.apply(old, fp)

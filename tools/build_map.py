@@ -19,8 +19,13 @@ def main():
     opened = collections.defaultdict(list)
     receivers = collections.defaultdict(set)
     lambdas = collections.defaultdict(set)
+    modules = collections.defaultdict(set)
+    attr_reads = collections.defaultdict(set)
+    attr_import = set()
+    have_attrs = False
     num_to_id = {str(t["number"]): t["id"] for t in tests}
-    for p in glob.glob(f"{trace_dir}/*.*.json"):
+    paths = [p for d in trace_dir.split(",") for p in glob.glob(f"{d}/*.*.json")]
+    for p in paths:
         r = json.load(open(p))
         ti = index[num_to_id[r["test"]]]
         for f, ls in r["lines"].items():
@@ -34,6 +39,13 @@ def main():
             receivers[k].add(ti)
         for f, ln in r.get("lambdas", []):
             lambdas[f"{f}:{ln}"].add(ti)
+        for m in r.get("modules", []):
+            modules[m].add(ti)
+        if "attr_reads" in r:
+            have_attrs = True
+            for a in r["attr_reads"]:
+                attr_reads[a].add(ti)
+            attr_import.update(r["attr_import"])
     sets = {}
     set_list = []
 
@@ -53,7 +65,11 @@ def main():
         "opened": {o: sid(set(ts)) for o, ts in opened.items()},
         "receivers": {k: sid(ts) for k, ts in receivers.items()},
         "lambdas": {k: sid(ts) for k, ts in lambdas.items()},
+        "modules": {k: sid(ts) for k, ts in modules.items()},
     }
+    if have_attrs:
+        data["attr_reads"] = {k: sid(ts) for k, ts in attr_reads.items()}
+        data["attr_import"] = sorted(attr_import)
     data["sets"] = [_encode(s) for s in set_list]
     if len(sys.argv) > 4:
         classes = json.load(open(sys.argv[4]))
@@ -64,6 +80,7 @@ def main():
         sys.path.insert(0, os.path.dirname(__file__))
         import xrefs
         data["xrefs"] = xrefs.build(sys.argv[5])
+        data["str_names"] = xrefs.upper_strings(sys.argv[5])
     raw = json.dumps(data, separators=(",", ":")).encode()
     with gzip.open(out, "wb", 9) as f:
         f.write(raw)
