@@ -18,6 +18,7 @@ sys.path.insert(0, str(HERE))
 
 from br.pack import pack  # noqa: E402
 from br.select import CovMap, analyze  # noqa: E402
+from br import tpcds_check  # noqa: E402
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
 ROOT = os.environ.get("BR_SQLGLOT", "/opt/sqlglot")
@@ -40,14 +41,24 @@ def main():
     if unmapped:
         log(f"warning: {len(unmapped)} tests are not in the map")
     lines = []
+    tpcds = num_by_id.get(tpcds_check.TEST)
+    # the TPC-DS check runs patched sqlglot in a child process: cap its total time
+    budget_until = t0 + float(os.environ.get("BR_TPCDS_BUDGET", "100"))
     for patch in sorted((DATA / "commits").glob("*.patch")):
         cid = patch.stem
         try:
-            ch = analyze(patch.read_text(encoding="utf-8", errors="replace"), ROOT, cmap)
+            text = patch.read_text(encoding="utf-8", errors="replace")
+            ch = analyze(text, ROOT, cmap)
             sel = {to_num[i] for i in ch.tests if to_num[i] is not None}
             if ch.broad and unmapped:
                 sel |= set(unmapped)
             why = f"{len(sel)} tests" + (" (broad)" if ch.broad else "")
+            if tpcds in sel:
+                c0 = time.time()
+                if tpcds_check.droppable(text, ch.new_files, ROOT, budget_until):
+                    sel.discard(tpcds)
+                    why += " -tpcds"
+                why += f" (tpcds check {time.time() - c0:.1f}s)"
         except Exception:  # noqa: BLE001 - never crash: fall back to running everything
             log(f"{cid}: analysis failed, running everything\n{traceback.format_exc()}")
             sel = set(all_nums)
@@ -58,7 +69,11 @@ def main():
     sys.stdout.write("\n".join(lines) + ("\n" if lines else ""))
     sys.stdout.flush()
     cpu = time.process_time()
-    log(f"done {len(lines)} commits in {time.time() - t0:.1f}s wall, {cpu:.2f}s cpu")
+    import resource
+
+    ch_cpu = resource.getrusage(resource.RUSAGE_CHILDREN)
+    log(f"done {len(lines)} commits in {time.time() - t0:.1f}s wall, {cpu:.2f}s cpu "
+        f"+ {ch_cpu.ru_utime + ch_cpu.ru_stime:.2f}s in checks")
 
 
 if __name__ == "__main__":

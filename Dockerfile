@@ -13,11 +13,14 @@ with tarfile.open(fileobj=io.BytesIO(data)) as tf:
     tf.extractall("/opt", filter="data")
 shutil.move(f"/opt/sqlglot-{sha}", "/opt/sqlglot")
 PY
-RUN chmod -R a+rX /opt/sqlglot
+RUN python -m compileall -q /opt/sqlglot/sqlglot && chmod -R a+rX /opt/sqlglot
 
 COPY selector.py /app/selector.py
 COPY br /app/br
 COPY maps /app/maps
+# pinned TPC-DS fingerprints, computed in this exact image (see br/tpcds_check.py)
+RUN cd /tmp && PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 python -s /app/br/tpcds_probe.py /opt/sqlglot /opt/sqlglot \
+    > /app/maps/tpcds_fp.json && python -c "import json; assert len(json.load(open('/app/maps/tpcds_fp.json'))) == 99"
 RUN python /app/br/compile_map.py /app/maps/map.json.gz /app/maps/map.pkl \
     && chmod -R a+rX /app && python -m compileall -q /app/br
 CMD ["python", "/app/selector.py"]

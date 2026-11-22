@@ -83,6 +83,28 @@ Per changed file:
 
 Any analysis error falls back to running every test.
 
+## The TPC-DS executor test (`br/tpcds_check.py`)
+
+`test_execute_tpcds` (21.5 s) runs most of sqlglot, so it is selected for
+about 18% of code edits, and fails only for some. When it is selected, the
+selector drops it if all three hold:
+
+1. the patch only edits statements inside function bodies of `sqlglot/*.py`,
+   outside `sqlglot/executor/`;
+2. none of those statements runs inside `PythonExecutor` (plan code generation
+   and data processing) or at import time. `tools/tpcds_lines.py` traced those
+   lines over the real fixture data (`maps/tpcds_lines.json`);
+3. `br/tpcds_probe.py`, run in a child process on a `/tmp` copy of the tree with
+   the patch applied, produces the same per-query fingerprint as the pinned
+   tree (computed in the image at build time). The fingerprint covers parse and
+   pickle without errors, the tables used, every plan step with its
+   expressions, types, comments and meta, and the duckdb SQL. The probe runs
+   in the test's own mode (`unittest` imported first) and stops at the first
+   query that differs.
+
+Everything the executor and duckdb receive is then identical, so the rows
+compared are too. Checks share a 100 s budget per run.
+
 ## Packing (`br/pack.py`)
 
 Longest-processing-time first onto k workers for every k in 1..8, keeping the
