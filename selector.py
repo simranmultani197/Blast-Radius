@@ -53,6 +53,10 @@ def main():
             if ch.broad and unmapped:
                 sel |= set(unmapped)
             why = f"{len(sel)} tests" + (" (broad)" if ch.broad else "")
+            if tpcds in sel and os.environ.get("BR_DIAG") == "no_tpcds":
+                # diagnostic build only (Dockerfile ENV): measures what this test costs
+                sel.discard(tpcds)
+                why += " -tpcds(diag)"
             if tpcds in sel:
                 c0 = time.time()
                 if tpcds_check.droppable(text, ch.new_files, ROOT, budget_until):

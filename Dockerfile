@@ -23,4 +23,6 @@ RUN cd /tmp && PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 python -s /app/br/tpcd
     > /app/maps/tpcds_fp.json && python -c "import json; assert len(json.load(open('/app/maps/tpcds_fp.json'))) == 99"
 RUN python /app/br/compile_map.py /app/maps/map.json.gz /app/maps/map.pkl \
     && chmod -R a+rX /app && python -m compileall -q /app/br
+# DIAGNOSTIC BUILD: never selects test_execute_tpcds. Not a final candidate.
+ENV BR_DIAG=no_tpcds
 CMD ["python", "/app/selector.py"]
