@@ -94,6 +94,53 @@ def guard(patch_text, root):
     return True
 
 
+def class_level_guard(patch_text, root):
+    """Like guard(), but also admits class- and module-level statements and
+    insertions outside functions. Their effects happen when the module is
+    imported, before the probe parses query 0, so the probe's fingerprints
+    (parse, plan, duckdb SQL of every query) see them. Statements with any line
+    that runs inside PythonExecutor (maps/tpcds_exec_lines.json) and import
+    statements are still rejected; function-body edits keep guard()'s rule."""
+    keep, ex = _load("tpcds_lines.json"), _load("tpcds_exec_lines.json")
+    if not keep or not ex:
+        return False
+    keep, ex = keep["lines"], ex["lines"]
+    fps = P.parse(patch_text)
+    if not fps:
+        return False
+    for fp in fps:
+        p = fp.path
+        if fp.binary or fp.old_path is None or fp.new_path is None or fp.old_path != fp.new_path \
+                or not p.endswith(".py") or not p.startswith("sqlglot/") or p.startswith("sqlglot/executor/"):
+            return False
+        try:
+            with open(os.path.join(root, p), encoding="utf-8", newline="") as f:
+                old = f.read()
+        except OSError:
+            return False
+        tree = A.parse(old)
+        if tree is None:
+            return False
+        fi = A.FileIndex(old, tree)
+        hot, exec_hot = set(keep.get(p, ())), set(ex.get(p, ()))
+        removed, inserts = P.changed_old_lines(fp)
+        for line in removed:
+            u = fi.smallest_unit(line)
+            if u is None or isinstance(u.node, (ast.Import, ast.ImportFrom)):
+                return False
+            if u.scope == "function":
+                if isinstance(u.node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)) \
+                        or any(ln in hot for ln in range(u.start, u.end + 1)):
+                    return False
+            elif any(ln in exec_hot for ln in range(u.start, u.end + 1)):
+                return False
+        for after in inserts:
+            fn = _enclosing_function(tree, after)
+            if fn is not None and any(ln in hot for ln in range(fn.lineno, fn.end_lineno + 1)):
+                return False
+    return True
+
+
 def _duckdb_module_guard(patch_text, new_files, root, process_profile):
     """Admit DuckDB-dialect module edits only with complete process evidence.
 
@@ -255,7 +302,7 @@ def _patch_farm(farm, new_files):
     return farm
 
 
-def unchanged(new_files, root, timeout=60):
+def unchanged(new_files, root, timeout=60, preimport=False):
     """Run the probe on the patched tree and compare with the pinned fingerprint."""
     pinned = _load("tpcds_fp.json")
     if not pinned:
@@ -266,7 +313,7 @@ def unchanged(new_files, root, timeout=60):
     try:
         env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "/tmp"),
                "PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1"}
-        if TPCDS_MODULE in new_files:
+        if preimport or TPCDS_MODULE in new_files:
             # an edit of the dialect module: import it before the first query,
             # so its import-time effects reach every query the probe checks
             env["BR_PROBE_PREIMPORT"] = "1"
@@ -287,6 +334,8 @@ def unchanged(new_files, root, timeout=60):
 def droppable(patch_text, new_files, root, budget_until=None, process_profile=None):
     if budget_until is not None and time.time() > budget_until:
         return False
-    structurally_covered = guard(patch_text, root) or _duckdb_module_guard(
-        patch_text, new_files, root, process_profile)
-    return structurally_covered and unchanged(new_files, root)
+    if guard(patch_text, root) or _duckdb_module_guard(patch_text, new_files, root, process_profile):
+        return unchanged(new_files, root)
+    # class/module-level edits: import the duckdb dialect before query 0 too,
+    # so every query is checked after all import-time effects
+    return class_level_guard(patch_text, root) and unchanged(new_files, root, preimport=True)
