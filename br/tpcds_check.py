@@ -16,6 +16,10 @@ those inputs changes or something raises. A patch is accepted when:
    only the plans of a few queries with a small known run time differ, it runs
    those queries on the fixture data with the patched code and requires the
    same rows as the pinned tree (maps/tpcds_rows.json, computed at build).
+   When the duckdb SQL of some queries differs, it runs the new SQL in duckdb
+   (the version the tests use, installed in the image) on the fixture data and
+   requires the same columns, types and rows as the pinned SQL
+   (maps/tpcds_duck.json, computed at build), with 1 and with 4 threads.
 
 Then everything the executor and duckdb see is identical, and so are the rows.
 """
@@ -150,7 +154,8 @@ def unchanged(new_files, root, timeout=60):
         env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "/tmp"),
                "PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1"}
         r = subprocess.run([sys.executable, "-s", os.path.join(HERE, "tpcds_probe.py"), farm, root,
-                            os.path.join(MAPS, "tpcds_fp.json"), os.path.join(MAPS, "tpcds_rows.json")],
+                            os.path.join(MAPS, "tpcds_fp.json"), os.path.join(MAPS, "tpcds_rows.json"),
+                            os.path.join(MAPS, "tpcds_duck.json")],
                            capture_output=True, text=True, env=env, timeout=timeout,
                            cwd=os.path.dirname(farm))
         if r.returncode:

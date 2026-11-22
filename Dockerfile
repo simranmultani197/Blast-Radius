@@ -15,6 +15,11 @@ shutil.move(f"/opt/sqlglot-{sha}", "/opt/sqlglot")
 PY
 RUN python -m compileall -q /opt/sqlglot/sqlglot && chmod -R a+rX /opt/sqlglot
 
+# duckdb, the version the tests were labelled with (requirements.lock): the
+# TPC-DS check runs changed duckdb SQL on the fixture data. Optional: without it
+# the check keeps the test whenever duckdb SQL changes.
+RUN pip install --no-cache-dir --only-binary=:all: duckdb==2.0.0 || true
+
 COPY selector.py /app/selector.py
 COPY br /app/br
 COPY maps /app/maps
@@ -22,7 +27,10 @@ COPY maps /app/maps
 RUN cd /tmp && export PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 \
     && python -s /app/br/tpcds_probe.py /opt/sqlglot /opt/sqlglot fp > /app/maps/tpcds_fp.json \
     && python -s /app/br/tpcds_probe.py /opt/sqlglot /opt/sqlglot rows > /app/maps/tpcds_rows.json \
-    && python -c "import json; assert len(json.load(open('/app/maps/tpcds_fp.json'))) == 99; assert len(json.load(open('/app/maps/tpcds_rows.json'))) == 57"
+    && python -c "import json; assert len(json.load(open('/app/maps/tpcds_fp.json'))) == 99; assert len(json.load(open('/app/maps/tpcds_rows.json'))) == 57" \
+    && { { python -s /app/br/tpcds_probe.py /opt/sqlglot /opt/sqlglot duck > /app/maps/tpcds_duck.json \
+           && python -c "import json; assert len(json.load(open('/app/maps/tpcds_duck.json'))['q']) == 57"; } \
+         || echo '{"q": {}, "load": {}}' > /app/maps/tpcds_duck.json; }
 RUN python /app/br/compile_map.py /app/maps/map.json.gz /app/maps/map.pkl \
     && chmod -R a+rX /app && python -m compileall -q /app/br
 CMD ["python", "/app/selector.py"]

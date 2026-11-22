@@ -102,11 +102,18 @@ selector drops it if all three hold:
    plans of up to 5 queries differ (and their pinned run time is under 3 s),
    the probe runs those queries on the fixture data with the patched code and
    requires exactly the pinned rows (`maps/tpcds_rows.json`, built in the
-   image). The probe runs in the test's own mode (`unittest` imported first)
-   and stops at the first query it cannot settle.
+   image). When the duckdb SQL of some queries differs, it runs the new SQL
+   in duckdb 2.0.0 (the version the tests were labelled with, installed in the
+   image from PyPI) on the same fixture data, with 1 and with 4 threads, and
+   requires exactly the pinned columns, types and rows (`maps/tpcds_duck.json`,
+   built in the image; tables are loaded once, which gives the same results as
+   the test's CSV views on all 57 queries). The probe runs in the test's own
+   mode (`unittest` imported first) and stops at the first query it cannot
+   settle.
 
-Everything the executor and duckdb receive is then identical, so the rows
-compared are too. Checks share a 100 s budget per run.
+Everything the executor and duckdb receive is then identical, or they return
+exactly the pinned rows, so the comparison the test makes is too. Checks
+share a 100 s budget per run.
 
 ## Packing (`br/pack.py`)
 
