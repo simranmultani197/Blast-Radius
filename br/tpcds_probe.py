@@ -67,9 +67,11 @@ def main():
         k = kind(type(v))
         if k == "e":
             t = v.type
+            # children must point back at this node (the executor reads .parent)
+            linked = all(c.parent is v for c in v.iter_expressions())
             return [type(v).__name__, [[a, ser(x, ref)] for a, x in v.args.items()],
                     ser(t, ref) if t is not None and t is not v else None,
-                    v.comments or None, ser(v.meta, ref) if v.meta else None]
+                    v.comments or None, ser(v.meta, ref) if v.meta else None, linked]
         if k == "v":
             return [type(v).__name__, repr(v)] if v is not None else None
         if k == "l":

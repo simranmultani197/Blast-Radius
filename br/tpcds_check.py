@@ -101,6 +101,16 @@ def _enclosing_function(tree, after):
 def _farm(root, new_files):
     farm = tempfile.mkdtemp(prefix="br_tpcds_", dir="/tmp" if os.path.isdir("/tmp") else None)
     base = os.path.join(root, "sqlglot")
+    try:
+        _mirror(base, root, farm)
+    except OSError:
+        shutil.rmtree(farm, ignore_errors=True)
+        return None
+    return _patch_farm(farm, new_files)
+
+
+def _mirror(base, root, farm):
+    """Symlinks only (and the read-only __pycache__ dirs): a few KB in /tmp."""
     for dp, dns, fns in os.walk(base):
         rel = os.path.relpath(dp, root)
         os.makedirs(os.path.join(farm, rel), exist_ok=True)
@@ -110,16 +120,21 @@ def _farm(root, new_files):
                 dns.remove(d)
         for fn in fns:
             os.symlink(os.path.join(dp, fn), os.path.join(farm, rel, fn))
-    for path, text in new_files.items():
-        if not path.startswith("sqlglot/") or text is None:
-            return None
-        dst = os.path.join(farm, path)
-        if not os.path.lexists(dst):
-            shutil.rmtree(farm, ignore_errors=True)
-            return None
-        os.remove(dst)
-        with open(dst, "w", encoding="utf-8", newline="") as f:
-            f.write(text)
+
+
+def _patch_farm(farm, new_files):
+    try:
+        for path, text in new_files.items():
+            dst = os.path.join(farm, path)
+            if not path.startswith("sqlglot/") or text is None or not os.path.lexists(dst):
+                shutil.rmtree(farm, ignore_errors=True)
+                return None
+            os.remove(dst)
+            with open(dst, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+    except OSError:
+        shutil.rmtree(farm, ignore_errors=True)
+        return None
     return farm
 
 

@@ -98,7 +98,7 @@ selector drops it if all three hold:
    the patch applied, produces the same per-query fingerprint as the pinned
    tree (computed in the image at build time). The fingerprint covers parse and
    pickle without errors, the tables used, every plan step with its
-   expressions, types, comments and meta, and the duckdb SQL. When only the
+   expressions, types, comments, meta and parent links, and the duckdb SQL. When only the
    plans of up to 5 queries differ (and their pinned run time is under 3 s),
    the probe runs those queries on the fixture data with the patched code and
    requires exactly the pinned rows (`maps/tpcds_rows.json`, built in the
