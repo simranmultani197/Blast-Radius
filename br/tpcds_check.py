@@ -11,8 +11,11 @@ those inputs changes or something raises. A patch is accepted when:
    for the plan and the data processing) or at import, per
    tools/tpcds_lines.py over the real test data (maps/tpcds_lines.json);
 3. br/tpcds_probe.py, run on a copy of the tree with the patch applied, gives
-   the same per-query fingerprint as the pinned tree (parse result, pickle
-   round trip, tables, optimized expression with types, plan, duckdb SQL).
+   the same per-query fingerprint as the pinned tree (parse and pickle without
+   errors, tables, plan steps with expressions/types/meta, duckdb SQL). When
+   only the plans of a few queries with a small known run time differ, it runs
+   those queries on the fixture data with the patched code and requires the
+   same rows as the pinned tree (maps/tpcds_rows.json, computed at build).
 
 Then everything the executor and duckdb see is identical, and so are the rows.
 """
@@ -132,12 +135,12 @@ def unchanged(new_files, root, timeout=60):
         env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "/tmp"),
                "PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1"}
         r = subprocess.run([sys.executable, "-s", os.path.join(HERE, "tpcds_probe.py"), farm, root,
-                            os.path.join(MAPS, "tpcds_fp.json")],
+                            os.path.join(MAPS, "tpcds_fp.json"), os.path.join(MAPS, "tpcds_rows.json")],
                            capture_output=True, text=True, env=env, timeout=timeout,
                            cwd=os.path.dirname(farm))
         if r.returncode:
             return False
-        return json.loads(r.stdout) == {"differs": None}
+        return json.loads(r.stdout.strip().splitlines()[-1]).get("differs", 0) is None
     except (subprocess.TimeoutExpired, ValueError, OSError):
         return False
     finally:

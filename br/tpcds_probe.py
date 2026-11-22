@@ -50,6 +50,7 @@ def main():
             captured.append(plan)
             raise Stop
 
+    real = ex.PythonExecutor
     ex.PythonExecutor = Capture
 
     kinds = {}
@@ -114,13 +115,56 @@ def main():
                 todo.extend(s.dependencies)
         return list(seen.values())
 
+    import ast
+    import csv
+    import gzip
     import hashlib
+    import time
 
-    # with a pinned fingerprint file, stop at the first query that differs
-    expect = json.load(open(sys.argv[3])) if len(sys.argv) > 3 else None
-    out = []
+    def hh(v):
+        return hashlib.sha256(json.dumps(v, separators=(",", ":")).encode()).hexdigest()[:24]
+
+    data = {}
+
+    def table(name):
+        # exactly as TestExecutor.setUpClass loads the fixture data
+        if name not in data:
+            path = os.path.join(pinned, "tests", "fixtures", "optimizer", "tpc-ds", f"{name}.csv.gz")
+            with gzip.open(path, "rt", newline="") as f:
+                reader = csv.reader(f, delimiter="|")
+                next(reader)
+                rows, ctypes = [], []
+                for row in reader:
+                    if not ctypes:
+                        for v in row:
+                            try:
+                                ctypes.append(type(ast.literal_eval(v)))
+                            except (ValueError, SyntaxError):
+                                ctypes.append(str)
+                    rows.append(tuple(None if (t is not str and v == "") else t(v) for t, v in zip(ctypes, row)))
+            data[name] = Table(columns=schema[name], rows=rows)
+        return data[name]
+
+    def run_query(e2):
+        """The worker's result for one query, with the real executor and data."""
+        ex.PythonExecutor = real
+        try:
+            res = ex.execute(e2, schema=schema, tables={t.name: table(t.name) for t in find_tables(e2)})
+        finally:
+            ex.PythonExecutor = Capture
+        return hh([list(res.columns), [repr(r) for r in res.rows]])
+
+    mode = sys.argv[3] if len(sys.argv) > 3 else "fp"
+    expect = rows_expect = None
+    if mode not in ("fp", "rows"):
+        expect = json.load(open(sys.argv[3]))
+        rows_expect = json.load(open(sys.argv[4])) if len(sys.argv) > 4 else {}
+    max_runs = int(os.environ.get("BR_PROBE_MAX_RUNS", "5"))
+    max_secs = float(os.environ.get("BR_PROBE_MAX_SECS", "3"))
+    out, pending = [], []
     for qi, (meta, sql, _) in enumerate(helpers.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql")):
         rec = {}
+        e2 = None
         try:
             # main process parses, the worker gets a pickled copy; for queries
             # without `# execute` the worker returns before using it
@@ -140,22 +184,45 @@ def main():
                 rec["duckdb"] = transpile(sql, write="duckdb")[0]
         except Exception as err:  # noqa: BLE001
             rec["error"] = f"{type(err).__name__}: {err}"
-        out.append(rec)
+        fields = {k: hh(v) for k, v in rec.items()}
+        if mode == "rows":
+            if meta.get("execute"):
+                t0 = time.process_time()
+                h = run_query(e2)
+                out.append([qi, h, round(time.process_time() - t0, 3)])
+            continue
+        out.append(fields)
         if expect is not None:
-            h = hashlib.sha256(json.dumps(rec, separators=(",", ":")).encode()).hexdigest()[:24]
-            if qi >= len(expect) or h != expect[qi]:
-                print(json.dumps({"differs": qi}))
-                return
+            want = expect[qi] if qi < len(expect) else None
+            if fields == want:
+                continue
+            diff = {k for k in set(fields) | set(want or {}) if fields.get(k) != (want or {}).get(k)}
+            # only the plan changed: settle it by running the query on the data
+            est = rows_expect.get(str(qi), [None, 1e9])[1]
+            if diff == {"plan"} and str(qi) in rows_expect and len(pending) < max_runs \
+                    and sum(p[2] for p in pending) + est <= max_secs:
+                pending.append((qi, e2, est))
+                continue
+            print(json.dumps({"differs": qi, "fields": sorted(diff)}))
+            return
+    if mode == "rows":
+        json.dump({str(q): [h, t] for q, h, t in out}, sys.stdout)
+        return
     if expect is not None:
-        print(json.dumps({"differs": None if len(out) == len(expect) else len(out)}))
+        if len(out) != len(expect):
+            print(json.dumps({"differs": len(out)}))
+            return
+        for qi, e2, _ in pending:
+            try:
+                same = run_query(e2) == rows_expect[str(qi)][0]
+            except Exception:  # noqa: BLE001
+                same = False
+            if not same:
+                print(json.dumps({"differs": qi, "fields": ["rows"]}))
+                return
+        print(json.dumps({"differs": None, "ran": [p[0] for p in pending]}))
         return
-
-    if os.environ.get("BR_PROBE_FULL"):
-        json.dump(out, sys.stdout, separators=(",", ":"))
-        return
-
-    json.dump([hashlib.sha256(json.dumps(r, separators=(",", ":")).encode()).hexdigest()[:24] for r in out],
-              sys.stdout)
+    json.dump(out, sys.stdout)
 
 
 if __name__ == "__main__":

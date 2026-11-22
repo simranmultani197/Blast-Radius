@@ -19,8 +19,10 @@ COPY selector.py /app/selector.py
 COPY br /app/br
 COPY maps /app/maps
 # pinned TPC-DS fingerprints, computed in this exact image (see br/tpcds_check.py)
-RUN cd /tmp && PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 python -s /app/br/tpcds_probe.py /opt/sqlglot /opt/sqlglot \
-    > /app/maps/tpcds_fp.json && python -c "import json; assert len(json.load(open('/app/maps/tpcds_fp.json'))) == 99"
+RUN cd /tmp && export PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 \
+    && python -s /app/br/tpcds_probe.py /opt/sqlglot /opt/sqlglot fp > /app/maps/tpcds_fp.json \
+    && python -s /app/br/tpcds_probe.py /opt/sqlglot /opt/sqlglot rows > /app/maps/tpcds_rows.json \
+    && python -c "import json; assert len(json.load(open('/app/maps/tpcds_fp.json'))) == 99; assert len(json.load(open('/app/maps/tpcds_rows.json'))) == 57"
 RUN python /app/br/compile_map.py /app/maps/map.json.gz /app/maps/map.pkl \
     && chmod -R a+rX /app && python -m compileall -q /app/br
 CMD ["python", "/app/selector.py"]
