@@ -209,6 +209,9 @@ def main():
     duck_secs = float(os.environ.get("BR_PROBE_DUCK_SECS", "6"))
     out, pending = [], []
     duck_pending, duck_tables, duck_cost = [], set(), 0.0
+    if expect is not None and os.environ.get("BR_PROBE_PREIMPORT") == "1":
+        # the patch edits the duckdb dialect: import it before query 0 is parsed
+        import sqlglot.dialects.duckdb  # noqa: F401
     for qi, (meta, sql, _) in enumerate(helpers.load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql")):
         rec = {}
         e2 = None

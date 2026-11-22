@@ -26,6 +26,7 @@ Then everything the executor and duckdb see is identical, and so are the rows.
 from __future__ import annotations
 
 import ast
+import difflib
 import json
 import os
 import shutil
@@ -38,6 +39,7 @@ from . import analysis as A
 from . import patch as P
 
 TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+TPCDS_MODULE = "sqlglot/dialects/duckdb.py"
 HERE = os.path.dirname(os.path.abspath(__file__))
 MAPS = os.path.join(os.path.dirname(HERE), "maps")
 _DATA = {}
@@ -90,6 +92,117 @@ def guard(patch_text, root):
             if fn is None or any(ln in hot for ln in range(fn.lineno, fn.end_lineno + 1)):
                 return False
     return True
+
+
+def _duckdb_module_guard(patch_text, new_files, root, process_profile):
+    """Admit DuckDB-dialect module edits only with complete process evidence.
+
+    The probe below checks the exact TPC-DS parse/plan/SQL/results. The offline
+    profile additionally proves that the test's spawned executor workers do
+    not import this dialect module; all missing or incomplete evidence fails
+    closed.
+    """
+    if not process_profile or not process_profile.get("complete") or not process_profile.get("modules_complete"):
+        return False
+    if TPCDS_MODULE not in process_profile.get("main_modules", ()):
+        return False
+    if TPCDS_MODULE in process_profile.get("worker_modules", ()):
+        return False
+    fps = P.parse(patch_text)
+    if not fps or set(new_files) != {TPCDS_MODULE}:
+        return False
+    for fp in fps:
+        if fp.binary or fp.old_path != TPCDS_MODULE or fp.new_path != TPCDS_MODULE:
+            return False
+        if new_files.get(TPCDS_MODULE) is None:
+            return False
+        try:
+            with open(os.path.join(root, TPCDS_MODULE), encoding="utf-8", newline="") as f:
+                old = f.read()
+        except OSError:
+            return False
+        new = new_files[TPCDS_MODULE]
+        old_tree, new_tree = A.parse(old), A.parse(new)
+        if old_tree is None or new_tree is None:
+            return False
+        old_index, new_index = A.FileIndex(old, old_tree), A.FileIndex(new, new_tree)
+        old_imports, new_imports = _imported_names(old_tree), _imported_names(new_tree)
+        if old_imports != new_imports:
+            return False
+        old_lines, new_lines = old.splitlines(), new.splitlines()
+        changed_code = 0
+        matcher = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == "equal":
+                continue
+            for index, tree, first, last in ((old_index, old_tree, i1, i2),
+                                              (new_index, new_tree, j1, j2)):
+                for offset in range(first, last):
+                    line = offset + 1
+                    if line not in index.code:
+                        continue
+                    changed_code += 1
+                    unit = index.smallest_unit(line)
+                    if unit is None or unit.scope not in ("class", "module") \
+                            or not _declarative_assignment(unit.node, old_imports, tree):
+                        return False
+        if not changed_code:
+            return False
+    return True
+
+
+def _imported_names(tree):
+    names = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            names.update(alias.asname or alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.update(alias.asname or alias.name for alias in node.names if alias.name != "*")
+    return names
+
+
+def _declarative_assignment(node, imported_names, tree):
+    """Only plain assignments with simple container/value syntax.
+
+    No set displays (their iteration order is not pinned). A bare name or
+    attribute value binds an object that is also reachable elsewhere, so it is
+    rejected when anything in the file (`tree`, the side of the patch the unit
+    is on) reads into or mutates the target through attribute access,
+    subscripting or augmented assignment: `X = Base.X` then `X.pop(...)`
+    would mutate the shared object.
+    """
+    if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+        return False
+    target = node.targets[0]
+    if not isinstance(target, ast.Name) or target.id in imported_names:
+        return False
+    if isinstance(node.value, (ast.Name, ast.Attribute)) and _used_through(target.id, tree):
+        return False
+    safe = (ast.Constant, ast.Name, ast.Attribute, ast.Dict, ast.List, ast.Tuple, ast.Load)
+    for n in ast.walk(node.value):
+        if not isinstance(n, safe):
+            return False
+        if isinstance(n, ast.Attribute):
+            root = n
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if not isinstance(root, ast.Name) or root.id not in imported_names:
+                return False
+    return True
+
+
+def _used_through(name, tree):
+    """True when `name` is the root Name of an Attribute/Subscript, or an AugAssign target, in tree."""
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Attribute, ast.Subscript)):
+            root = n.value
+            while isinstance(root, (ast.Attribute, ast.Subscript)):
+                root = root.value
+            if isinstance(root, ast.Name) and root.id == name:
+                return True
+        elif isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Name) and n.target.id == name:
+            return True
+    return False
 
 
 def _enclosing_function(tree, after):
@@ -153,6 +266,10 @@ def unchanged(new_files, root, timeout=60):
     try:
         env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "/tmp"),
                "PYTHONHASHSEED": "0", "PYTHONDONTWRITEBYTECODE": "1"}
+        if TPCDS_MODULE in new_files:
+            # an edit of the dialect module: import it before the first query,
+            # so its import-time effects reach every query the probe checks
+            env["BR_PROBE_PREIMPORT"] = "1"
         r = subprocess.run([sys.executable, "-s", os.path.join(HERE, "tpcds_probe.py"), farm, root,
                             os.path.join(MAPS, "tpcds_fp.json"), os.path.join(MAPS, "tpcds_rows.json"),
                             os.path.join(MAPS, "tpcds_duck.json")],
@@ -167,7 +284,9 @@ def unchanged(new_files, root, timeout=60):
         shutil.rmtree(farm, ignore_errors=True)
 
 
-def droppable(patch_text, new_files, root, budget_until=None):
+def droppable(patch_text, new_files, root, budget_until=None, process_profile=None):
     if budget_until is not None and time.time() > budget_until:
         return False
-    return guard(patch_text, root) and unchanged(new_files, root)
+    structurally_covered = guard(patch_text, root) or _duckdb_module_guard(
+        patch_text, new_files, root, process_profile)
+    return structurally_covered and unchanged(new_files, root)

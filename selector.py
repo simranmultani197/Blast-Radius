@@ -55,7 +55,13 @@ def main():
             why = f"{len(sel)} tests" + (" (broad)" if ch.broad else "")
             if tpcds in sel:
                 c0 = time.time()
-                if tpcds_check.droppable(text, ch.new_files, ROOT, budget_until):
+                try:
+                    drop = tpcds_check.droppable(text, ch.new_files, ROOT, budget_until,
+                                                 cmap.tpcds_process_profile)
+                except Exception:  # noqa: BLE001 - the check failing keeps the test
+                    log(f"{cid}: tpcds check failed, keeping the test\n{traceback.format_exc()}")
+                    drop = False
+                if drop:
                     sel.discard(tpcds)
                     why += " -tpcds"
                 why += f" (tpcds check {time.time() - c0:.1f}s)"

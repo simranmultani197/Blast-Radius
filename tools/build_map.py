@@ -2,12 +2,18 @@
 
     python3 tools/build_map.py sample/tests.json .work/trace maps/map.json.gz
 """
+import ast
 import collections
 import glob
-import os
 import gzip
 import json
+import os
 import sys
+
+
+TPCDS_TEST = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+TPCDS_MODULE = "sqlglot/dialects/duckdb.py"
+TPCDS_TEST_FILE = "tests/test_executor.py"
 
 
 def main():
@@ -38,6 +44,7 @@ def main():
     has_errmsg = False
     num_to_id = {str(t["number"]): t["id"] for t in tests}
     paths = [p for d in trace_dir.split(",") for p in glob.glob(f"{d}/*.*.json")]
+    tpcds_processes = collections.defaultdict(list)
     has_dict, has_ev, has_cmp = set(), set(), set()
     # feature -> trace dir -> test -> [processes recorded, processes with the feature]
     per_dir = collections.defaultdict(lambda: collections.defaultdict(lambda: [0, 0]))
@@ -45,6 +52,8 @@ def main():
         r = json.load(open(p))
         ti = index[num_to_id[r["test"]]]
         tdir = os.path.dirname(p)
+        if ids[ti] == TPCDS_TEST:
+            tpcds_processes[tdir].append(r)
         for feat, field in (("dict", "dict_keys"), ("ev", "ev"), ("cmp", "cmp_diff"), ("errmsg", "errmsg"), ("cmpi", "cmp_import_diff")):
             c = per_dir[(feat, tdir)][ti]
             c[0] += 1
@@ -115,6 +124,10 @@ def main():
         "lambdas": {k: sid(ts) for k, ts in lambdas.items()},
         "modules": {k: sid(ts) for k, ts in modules.items()},
     }
+    if len(sys.argv) > 5:
+        profile = _tpcds_process_profile(tests, trace_dir.split(","), tpcds_processes, sys.argv[5])
+        if profile is not None:
+            data["tpcds_process_profile"] = profile
     all_t = set(range(len(ids)))
     complete = collections.defaultdict(set)
     for (feat, _d), tests_ in per_dir.items():
@@ -168,6 +181,68 @@ def main():
         f.write(raw)
     print(f"files={len(files)} lines={sum(len(v) for v in files.values())} "
           f"sets={len(set_list)} raw={len(raw)/1e6:.1f}MB", file=sys.stderr)
+
+
+def _tpcds_process_profile(tests, trace_dirs, processes, root):
+    """Record complete parent/worker import evidence for the TPC-DS test.
+
+    A process is the test parent only when it executes the test method body;
+    spawned workers import the test module (and thus see the def line) but do
+    not execute that body. Missing results, incomplete module tracing, or an
+    ambiguous process split make the profile unusable by the selector.
+    """
+    target = next((t for t in tests if t["id"] == TPCDS_TEST), None)
+    if target is None:
+        return None
+    try:
+        with open(os.path.join(root, TPCDS_TEST_FILE), encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+    except (OSError, SyntaxError):
+        return None
+    test_body = None
+    for cls in tree.body:
+        if isinstance(cls, ast.ClassDef) and cls.name == "TestExecutor":
+            test_body = next((n for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                              and n.name == "test_execute_tpcds"), None)
+            break
+    if test_body is None or not test_body.body:
+        return None
+    body_lines = {line for stmt in test_body.body
+                  for line in range(stmt.lineno, getattr(stmt, "end_lineno", stmt.lineno) + 1)}
+
+    runs = []
+    for trace_dir in trace_dirs:
+        directory = os.path.normpath(trace_dir)
+        records = processes.get(directory, [])
+        main = [r for r in records if body_lines & set(r.get("lines", {}).get(TPCDS_TEST_FILE, []))]
+        main_ids = {id(r) for r in main}
+        workers = [r for r in records if id(r) not in main_ids]
+        try:
+            result = json.load(open(os.path.join(directory, f"{target['number']}.result")))
+            passed = result.get("rc") == 0 and not result.get("failed")
+        except (OSError, ValueError):
+            passed = False
+        traced = bool(records) and all("modules" in r for r in records)
+        main_modules = {m for r in main for m in r.get("modules", [])}
+        worker_modules = {m for r in workers for m in r.get("modules", [])}
+        good = passed and traced and len(main) == 1 and bool(workers) \
+            and TPCDS_MODULE in main_modules and TPCDS_MODULE not in worker_modules
+        runs.append({
+            "complete": good,
+            "main": main,
+            "workers": workers,
+        })
+
+    if not runs:
+        return None
+    all_records = [r for run in runs for role in ("main", "workers") for r in run[role]]
+    return {
+        "complete": all(run["complete"] for run in runs),
+        "runs": len(runs),
+        "main_modules": sorted({m for run in runs for r in run["main"] for m in r.get("modules", [])}),
+        "worker_modules": sorted({m for run in runs for r in run["workers"] for m in r.get("modules", [])}),
+        "modules_complete": bool(all_records) and all("modules" in r for r in all_records),
+    }
 
 
 def _encode(s):

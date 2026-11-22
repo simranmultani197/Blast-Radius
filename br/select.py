@@ -32,6 +32,7 @@ class CovMap:
         self.classes = d.get("classes", {})
         self.xrefs = d.get("xrefs", {})
         self.modules = d.get("modules", {})
+        self.tpcds_process_profile = d.get("tpcds_process_profile")
         self.attr_reads = d.get("attr_reads")
         self.attr_import = set(d.get("attr_import", []))
         self.str_names = set(d.get("str_names", []))
